@@ -136,13 +136,15 @@ def visualize_localization_scene(sensor_positions, source_positions):
     plt.show()
 
 
-def create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources):
-    # Step 1: Generate sensors
-    sensor_positions = generate_points_with_gap(
-        n_points=n_sensors,
-        d_self=d_sensor_sensor,
-        domain=domain
-    )
+def create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources, sensor_positions=None):
+
+    if sensor_positions is None:
+        # Step 1: Generate sensors
+        sensor_positions = generate_points_with_gap(
+            n_points=n_sensors,
+            d_self=d_sensor_sensor,
+            domain=domain
+        )
     # Step 2: Generate sources with respect to sensors
     source_positions = generate_points_with_gap(
         n_points=n_sources,
@@ -175,16 +177,27 @@ class SensorSourceGraphDataset(Dataset):
         self.__SAMPLE_SIZE_PER_SUBARRAY = 20
         self.__samples_model = Samples(self.__system_model_params)
 
+        _sensor_position = generate_points_with_gap(
+            n_points=n_sensors,
+            d_self=d_sensor_sensor,
+            domain=domain
+            )
+
+        # Put the sources in front of the sensors
+        y_max = max(_sensor_position, key=lambda x:x[1])[1]
+        # Fix the domain of sources locations
+        domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
 
         for index in range(D):
+
             #TODO: pass config file for the sensors
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
                                                                                        d_source_source, domain,
                                                                                        n_sensors,
-                                                                                       n_sources)
+                                                                                       n_sources, sensor_positions=_sensor_position)
 
-
-            draw_graph_with_precomputed_angles(model_graph)
+            print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
+            #draw_graph_with_precomputed_angles(model_graph)
 
             samples_graphs = []
             scene_model_dataset = []
