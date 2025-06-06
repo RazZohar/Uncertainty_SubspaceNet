@@ -4,6 +4,8 @@ import numpy as np
 import matplotlib.pyplot as plt
 import networkx as nx
 from torch.utils.data import Dataset
+import torch
+import os.path
 
 from src.utils import set_unified_seed
 from system_model import SystemModelParams
@@ -209,6 +211,13 @@ class SensorSourceGraphDataset(Dataset):
     def __getitem__(self, idx):
         return self.localization_scene[idx]
 
+    def save_to_file(self, filename):
+        path = os.path.dirname(filename)
+        if not os.path.exists(path):
+            os.makedirs(path)
+            print(f"Created path: {path}")
+        torch.save(self, filename)
+
 
 
 def test_data_creation():
@@ -238,8 +247,11 @@ def test_data_creation():
         domain=domain,
         configuration_file='../configuration/SignalsSubspaceNet_M=3_T=100_SNR_10_tau=None_NarrowBand_diff_method=None_non-coherent_eta=0_bias=0.0_sv_noise=0.json')
 
+    dataset.save_to_file('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
 
+    dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
 
+    print(dataset_load)
 
 if __name__ == '__main__':
     test_data_creation()
