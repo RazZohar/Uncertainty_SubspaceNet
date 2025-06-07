@@ -6,6 +6,7 @@ import json
 from system_model import SystemModelParams
 
 from models import SignalsSubspaceNetEsprit
+from multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 
 
 from localization_block import RayIntersection
@@ -65,14 +66,20 @@ class MultiSubarraysModel(nn.Module):
 
         bearings = []
         for subarray_index in range(self.number_of_sensors):
-            estimated_angles = self.subarray_models[subarray_index].forward(samples[subarray_index])
+            iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
+            estimated_angles = self.subarray_models[subarray_index].forward(iq_signals)
             bearings.insert(subarray_index, copy.deepcopy(estimated_angles))
 
-        # Assosicate angles
+        #TODO: Assosicate angles
+
+        # Intersect rays
         source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings)
         return source_estimated_position
 
 
 if __name__ == '__main__':
+    dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
     multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0), (2.5, 6)], multi_model_configuration="../configuration/multi_model_configuration.json")
+
+    multi_arrays_model(dataset_load.__getitem__(0))
     print(multi_arrays_model)
