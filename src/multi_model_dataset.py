@@ -108,6 +108,11 @@ def draw_graph_with_precomputed_angles(G):
     nx.draw_networkx_edges(G, pos, alpha=0.3)
     nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_color='green', font_size=8)
     plt.title("Sensor-Source Graph with Precomputed Angle Labels")
+
+    # TODO: limit by the domain
+    plt.xlim((0,10))
+    plt.ylim((-0.1, 10))
+
     plt.legend()
     plt.gca().set_aspect('equal')
     plt.grid(True)
@@ -175,14 +180,18 @@ class SensorSourceGraphDataset(Dataset):
             SystemModelParams()
         ).set_params_from_json(subarray_configuration)
 
-        self.__SAMPLE_SIZE_PER_SUBARRAY = 20
+        self.__SAMPLE_SIZE_PER_SUBARRAY = 200
         self.__samples_model = Samples(self.__system_model_params)
 
+        #TODO: we limit the source to be on X axis
+        source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
         _sensor_position = generate_points_with_gap(
             n_points=n_sensors,
             d_self=d_sensor_sensor,
-            domain=domain
+            domain=source_domain
             )
+
+
 
         # Put the sources in front of the sensors
         y_max = max(_sensor_position, key=lambda x:x[1])[1]
@@ -198,7 +207,7 @@ class SensorSourceGraphDataset(Dataset):
                                                                                        n_sources, sensor_positions=_sensor_position)
 
             print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
-            #draw_graph_with_precomputed_angles(model_graph)
+            draw_graph_with_precomputed_angles(model_graph)
 
             samples_graphs = []
             scene_model_dataset = []
@@ -237,11 +246,11 @@ class SensorSourceGraphDataset(Dataset):
 def test_data_creation():
     # Parameters
     domain = ((0, 10), (0, 10))  # (x range, y range)
-    n_sensors = 4
-    n_sources = 3
+    n_sensors = 2
+    n_sources = 1
     d_sensor_sensor = 1.0
     d_source_source = 1.5
-    d_sensor_source = 1.2
+    d_sensor_source = 2.5
 
     set_unified_seed()
     #model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources)
@@ -259,7 +268,7 @@ def test_data_creation():
         d_source_source=d_source_source,
         d_sensor_source=d_sensor_source,
         domain=domain,
-        configuration_file='../configuration/SignalsSubspaceNet_M=3_T=100_SNR_10_tau=None_NarrowBand_diff_method=None_non-coherent_eta=0_bias=0.0_sv_noise=0.json')
+        configuration_file='../configuration/multi_model_data_config.json')
 
     dataset.save_to_file('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
 

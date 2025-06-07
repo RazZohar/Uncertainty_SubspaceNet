@@ -70,6 +70,8 @@ class MultiSubarraysModel(nn.Module):
             estimated_angles = self.subarray_models[subarray_index].forward(iq_signals)
             bearings.insert(subarray_index, copy.deepcopy(estimated_angles))
 
+        #TODO: "Attentaion" for the fusion between subarrrays
+
         #TODO: Assosicate angles
 
         # Intersect rays
@@ -79,7 +81,7 @@ class MultiSubarraysModel(nn.Module):
 
 if __name__ == '__main__':
     dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
-    multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0), (2.5, 6)], multi_model_configuration="../configuration/multi_model_configuration.json")
+    multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0)], multi_model_configuration="../configuration/multi_model_configuration.json")
 
     multi_arrays_model(dataset_load.__getitem__(0))
     print(multi_arrays_model)
