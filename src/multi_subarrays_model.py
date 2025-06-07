@@ -1,10 +1,24 @@
 import torch.nn as nn
 import torch
+import copy
+import json
 
 from system_model import SystemModelParams
 
 from models import SignalsSubspaceNetEsprit
-import json
+
+
+from localization_block import RayIntersection
+
+
+def get_location_from_model_graph(model_graph, type_req='sensor'):
+    """
+    Return the position of the sensors
+    :param model_graph:
+    :return:
+    """
+    return [model_graph.nodes[node]['obj'].position for node in model_graph.nodes if type_req in node]
+
 
 class MultiSubarraysModel(nn.Module):
     def __init__(self, sensors_positions, multi_model_configuration):
@@ -22,6 +36,11 @@ class MultiSubarraysModel(nn.Module):
         #self.attentaion_list = nn.ModuleList()
         #self.create_attentaion_by_position(sensors_positions)
 
+        # Doa Assosication block
+        self.rays_intersection = RayIntersection()
+
+
+
 
 
     def _load_multi_model_configuration(self, multi_model_configuration_filename):
@@ -38,6 +57,20 @@ class MultiSubarraysModel(nn.Module):
         system_model_params = SystemModelParams()
         system_model_params.set_params_from_json(subarray_configuration)
         return SignalsSubspaceNetEsprit(N=system_model_params.N, T=system_model_params.T, tau=8, M=system_model_params.M, codebook_size=system_model_params.codebook_size)
+
+
+    def forward(self, localization_scene):
+        model_graph, samples = localization_scene
+        sensor_location = get_location_from_model_graph(model_graph)
+
+        bearings = []
+        for subarray_index in range(self.number_of_sensors):
+            estimated_angles = self.subarray_models[subarray_index].forward(samples[subarray_index])
+            bearings.insert(subarray_index, copy.deepcopy(estimated_angles))
+
+        # Assosicate angles
+        source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings)
+        return source_estimated_position
 
 
 if __name__ == '__main__':

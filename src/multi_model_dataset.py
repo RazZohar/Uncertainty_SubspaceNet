@@ -1,3 +1,4 @@
+import copy
 import json
 
 import numpy as np
@@ -188,7 +189,7 @@ class SensorSourceGraphDataset(Dataset):
         # Fix the domain of sources locations
         domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
 
-        for index in range(D):
+        for dataset_index in range(D):
 
             #TODO: pass config file for the sensors
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
@@ -209,14 +210,14 @@ class SensorSourceGraphDataset(Dataset):
                 subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model, samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
                                                             true_doa=relative_angles[index])
 
-                scene_model_dataset.append(subarray_model_dataset)
-                scene_generic_dataset.append(subarray_generic_dataset)
+                scene_model_dataset.insert(index, copy.deepcopy(subarray_model_dataset))
+                #scene_generic_dataset.append(subarray_generic_dataset)
 
 
 
-                samples_graphs.append((scene_model_dataset, scene_generic_dataset))
+            samples_graphs.insert(dataset_index, copy.deepcopy(scene_model_dataset))
 
-            self.localization_scene.append((model_graph, samples_graphs))
+            self.localization_scene.insert(dataset_index, (model_graph, copy.deepcopy(samples_graphs)))
 
     def __len__(self):
         return len(self.localization_scene)
