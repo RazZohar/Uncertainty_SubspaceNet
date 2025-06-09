@@ -1,0 +1,16 @@
+# Slurm files
+interactive*
+
+# Python and VSCode files
+__pycache__/
+*.pyc
+.vscode/
+.cursorrules
+
+# Project files
+requirements.txt
+wandb/
+
+
+#Data
+data/*

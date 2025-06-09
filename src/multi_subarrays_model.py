@@ -60,13 +60,28 @@ class MultiSubarraysModel(nn.Module):
         return SignalsSubspaceNetEsprit(N=system_model_params.N, T=system_model_params.T, tau=8, M=system_model_params.M, codebook_size=system_model_params.codebook_size)
 
 
-    def forward(self, localization_scene):
-        model_graph, samples = localization_scene
+    def forward(self, model_graph, IQ_signals_stack, doa_stack):
+
         sensor_location = get_location_from_model_graph(model_graph)
 
         bearings = []
         for subarray_index in range(self.number_of_sensors):
-            iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
+            # Original
+            # iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
+            
+            # With new dataset
+            # iq_signals is now a tensor with dim of (__SAMPLE_SIZE_PER_SUBARRAY,N,T)
+            # if you want only one sample for sub array (as in the code before) just use iq_signals[0]
+            iq_signals = IQ_signals_stack[subarray_index]
+            
+            # doa is now a tensor of dimension [M - Number of sources]. Each entry is the direction
+            # of source i from sensor array [subarray_index]
+            doa = doa_stack[subarray_index]
+            
+            #Suggestion:
+            # rand_idx = torch.randint(0, len(samples[subarray_index]), (1,)).item()
+            # iq_signal, doa = samples[subarray_index][rand_idx]
+            
             estimated_angles = self.subarray_models[subarray_index].forward(iq_signals)
             bearings.insert(subarray_index, copy.deepcopy(estimated_angles))
 
@@ -80,8 +95,9 @@ class MultiSubarraysModel(nn.Module):
 
 
 if __name__ == '__main__':
-    dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
-    multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0)], multi_model_configuration="../configuration/multi_model_configuration.json")
+    dataset_load = torch.load('/home/alonhel/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
+    multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0), (2.5, 6)], multi_model_configuration="/home/alonhel/MBDL_MultiSubArrays/configuration/multi_model_configuration.json")
 
-    multi_arrays_model(dataset_load.__getitem__(0))
+    model_graph, IQ_signals_stack, doa_stack = dataset_load.__getitem__(0)
+    multi_arrays_model(model_graph, IQ_signals_stack, doa_stack)
     print(multi_arrays_model)

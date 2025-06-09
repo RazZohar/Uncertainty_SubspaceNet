@@ -20,14 +20,14 @@ The implemented models:
         [2] "SubspaceNet: Deep Learning-Aided Subspace methods for DoA Estimation".
     
     * DA-MUSIC: Deep Augmented MUSIC model-based deep learning algorithm as described in
-        [3] J. P. Merkofer, G. Revach, N. Shlezinger, and R. J. van Sloun, “Deep
-        augmented MUSIC algorithm for data-driven DoA estimation,” in IEEE
+        [3] J. P. Merkofer, G. Revach, N. Shlezinger, and R. J. van Sloun, "Deep
+        augmented MUSIC algorithm for data-driven DoA estimation," in IEEE
         International Conference on Acoustics, Speech and Signal Processing
         (ICASSP), 2022, pp. 3598-3602."
         
     * DeepCNN: Deep learning algorithm as described in:
-        [4] G. K. Papageorgiou, M. Sellathurai, and Y. C. Eldar, “Deep networks
-        for direction-of-arrival estimation in low SNR,” IEEE Trans. Signal
+        [4] G. K. Papageorgiou, M. Sellathurai, and Y. C. Eldar, "Deep networks
+        for direction-of-arrival estimation in low SNR," IEEE Trans. Signal
         Process., vol. 69, pp. 3714-3729, 2021.
 
 Functions:
