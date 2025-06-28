@@ -2,9 +2,9 @@
 Details
 ----------
 Name: models.py
-Authors: Dor Haim Shmuel
+Authors: New by Raz Zohar
 Created: 01/10/21
-Edited: 02/06/23
+Edited: 22/06/2025
 
 Purpose:
 --------
@@ -42,6 +42,7 @@ import torch
 import torch.nn as nn
 import numpy as np
 import warnings
+import math
 
 from torch.ao.quantization import quantize
 
@@ -591,12 +592,13 @@ class SubspaceNet(nn.Module):
         )  # Shape: [Batch size, N, N]
         # Feed surrogate covariance to the differentiable subspace algorithm
         method_output = self.diff_method(Rz, self.M, self.batch_size)
-        if isinstance(method_output, tuple):
+        if isinstance(method_output, tuple) and len(method_output[0]) > 1:
             # Root MUSIC output
-            doa_prediction, doa_all_predictions, roots = method_output
+            doas, subspace_info = method_output
+            doa_prediction, doa_all_predictions, roots = doas
         else:
             # Esprit output
-            doa_prediction = method_output
+            doa_prediction, subspace_information = method_output
             doa_all_predictions, roots = None, None
         return doa_prediction, doa_all_predictions, roots, Rz, vq_loss
 
@@ -669,7 +671,7 @@ class SubspaceNetEsprit(SubspaceNet):
             Kx=Kx_tag, eps=1, batch_size=self.batch_size
         )  # Shape: [Batch size, N, N]
         # Feed surrogate covariance to Esprit algorithm
-        doa_prediction = esprit(Rz, self.M, self.batch_size)
+        doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
         return doa_prediction, Rz, vq_loss
 
 class ComplexConv1d(nn.Module):
@@ -790,7 +792,7 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         self.quantize_source = quantize
 
     def forward(self, x: torch.Tensor):
-        self.batch_size = x.shape[0]
+
 
         # part of the encoder is used as the sensed device
         vq_loss, z_quantized = self.sense_device_forward(x)
@@ -823,10 +825,14 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
                 return doa_prediction, doa_all_predictions, roots, Rz, vq_loss
                 """
         # Feed surrogate covariance to Esprit algorithm
-        doa_prediction = esprit(Rz, self.M, self.batch_size)
+        doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
+        eigen_values = torch.stack([pair[0] for pair in estimated_subspace])
+        eigen_vectors = torch.stack([pair[1] for pair in estimated_subspace]) # shape: [N, D]
+        cov_doa = doa_covariance_from_eig(eigen_values, eigen_vectors, doa_prediction, self.T)
         return Rz, doa_prediction
 
     def sense_device_forward(self, x):
+        self.batch_size = x.shape[0]
         x_e = self.encoder_signal(x)
         # Quantize
         x_normalized = x_e - x_e.mean()
@@ -1030,7 +1036,7 @@ class TaskIgnorantSubspaceNet(SubspaceNetEsprit):
             doa_all_predictions, roots = None, None
         return doa_prediction, doa_all_predictions, roots, Rz, total_loss
         """
-        doa_prediction = esprit(Rz, self.M, self.batch_size)
+        doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
         return doa_prediction, Rz, total_loss
 
 
@@ -1292,11 +1298,16 @@ def root_music(Rz: torch.Tensor, M: int, batch_size: int):
     f = 1
     doa_batches = []
     doa_all_batches = []
+    subspace_batches = []
     Bs_Rz = Rz
     for iter in range(batch_size):
         R = Bs_Rz[iter]
         # Extract eigenvalues and eigenvectors using EVD
         eigenvalues, eigenvectors = torch.linalg.eig(R)
+
+        # Add subspace information to later use in uncertanty
+        subspace_batches.append((eigenvalues, eigenvectors))
+
         # Assign noise subspace as the eigenvectors associated with M greatest eigenvalues
         Un = eigenvectors[:, torch.argsort(torch.abs(eigenvalues)).flip(0)][:, M:]
         # Generate hermitian noise subspace matrix
@@ -1327,7 +1338,7 @@ def root_music(Rz: torch.Tensor, M: int, batch_size: int):
         torch.stack(doa_batches, dim=0),
         torch.stack(doa_all_batches, dim=0),
         roots_to_return,
-    )
+    ), subspace_batches
 
 
 def esprit(Rz: torch.Tensor, M: int, batch_size: int):
@@ -1349,11 +1360,15 @@ def esprit(Rz: torch.Tensor, M: int, batch_size: int):
 
     doa_batches = []
 
+    subspace_batches = []
+
     Bs_Rz = Rz
     for iter in range(batch_size):
         R = Bs_Rz[iter]
         # Extract eigenvalues and eigenvectors using EVD
         eigenvalues, eigenvectors = torch.linalg.eig(R)
+
+        subspace_batches.append((eigenvalues, eigenvectors))
 
         # Get signal subspace
         Us = eigenvectors[:, torch.argsort(torch.abs(eigenvalues)).flip(0)][:, :M]
@@ -1378,4 +1393,117 @@ def esprit(Rz: torch.Tensor, M: int, batch_size: int):
 
         doa_batches.append(doa_predictions)
 
-    return torch.stack(doa_batches, dim=0)
+    return torch.stack(doa_batches, dim=0), subspace_batches
+
+## We introduce measure of uncertanty from
+## Asymptotic Performance Analysis of ESPRIT, Higher Order ESPRIT, and Virtual ESPRIT Algorithms
+## By Norman Yuen and Benjamin Friedlander,
+
+def steering_vec(N, theta, d=0.5, device=None):
+    """ULA steering vector  a(θ)  with spacing d·λ."""
+    n = torch.arange(N, device=device)
+    return torch.exp(1j * math.pi * d * n * torch.sin(theta))
+
+def steering_deriv(N, theta, d=0.5, device=None):
+    """∂a/∂θ for a ULA."""
+    n = torch.arange(N, device=device)
+    # Maybe later to use a precomputational steering vector
+    return 1j * math.pi * d * n * torch.cos(theta) * steering_vec(N, theta, d, device)
+
+def doa_covariance_from_eig(evals, evecs, thetas, N, d=0.5):
+    """
+    evals  : (B, M)              eigenvalues  (complex)
+    evecs  : (B, M, M)           eigenvectors (columns)
+    thetas : (B, r)  or  (r,)    DoA estimates  (rad)
+    N      : scalar or (B,)      snapshots used for R̂
+    d      : element spacing in λ units (default 0.5)
+    returns: (B, r, r)           plug-in CRB  Σ̂_θ
+    """
+    B, M = evals.shape
+    device = evals.device
+    r = thetas.shape[-1]              #  ------------  A
+
+    # 1. sort eigen-pairs
+    idx = torch.argsort(evals.real, dim=-1, descending=True)
+    evecs_sorted = torch.gather(evecs, 2, idx.unsqueeze(1).expand(-1, M, -1))
+    evals_sorted = torch.gather(evals, 1, idx)
+
+    # 2. noise sub-space  U_n   and projector  P_perp
+    Un  = evecs_sorted[:, :, r:]           # (B, M, M−r)
+    Un  = torch.linalg.qr(Un).Q           #  ------------  C  (B, M, M−r)
+    I   = torch.eye(M, device=device).expand(B, -1, -1)
+    Pperp = I - Un @ Un.conj().transpose(-1, -2)   #  ----  B (B,M,M)
+
+
+    Pperp = 0.5 * (Pperp + Pperp.conj().transpose(-1, -2))  # enforce Hermitian
+
+    # 3. noise power σ̂²   (mean of noise eigenvalues)
+    sigma2 = evals_sorted[:, r:].real.mean(dim=-1)      # (B,)
+
+    # 4. steering matrix  A(θ̂)  and derivative  D(θ̂)
+    if thetas.ndim == 1:
+        thetas = thetas.unsqueeze(0).repeat(B, 1)       # (B, r)
+    m = torch.arange(M, device=device).view(1, M, 1)    # (1,M,1)
+    sin_t = torch.sin(thetas).view(B, 1, r)
+    cos_t = torch.cos(thetas).view(B, 1, r)
+    A = torch.exp(1j * math.pi * d * m * sin_t)         # (B,M,r)
+    D = 1j * math.pi * d * m * cos_t * A                # (B,M,r)
+
+    # 5. Fisher information matrix  G = Dᴴ P⊥ D
+    G = D.conj().transpose(-1, -2) @ Pperp @ D          # (B,r,r)
+
+    # -----------------------------------------------
+    #
+    G = 0.5 * (G + G.conj().transpose(-1, -2))
+    eps = torch.linalg.eigvalsh(G).real.amax(dim=-1, keepdim=True) * 1e-6
+    Ginv = torch.linalg.inv(G + eps.unsqueeze(-1) * torch.eye(r, device=G.device))
+    # -----------------------------------------------
+    # Yuen & Friedlander (eq. )
+    if torch.is_tensor(N):
+        N = N.to(device).view(B, 1, 1)
+
+    Sigma = (sigma2 / (2 * N)).view(B, 1, 1) * torch.real(Ginv)
+    return Sigma
+
+
+
+def empirical_error_cov(theta_hat: torch.Tensor,
+                        theta_true: torch.Tensor) -> torch.Tensor:
+    """
+    Empirical covariance of the estimation error e = θ̂ − θ.
+
+    Parameters
+    ----------
+    theta_hat : (..., K) tensor       -- estimated DoA(s) - deg
+    theta_true: (..., K) tensor       -- ground-truth DoA(s) - deg
+        ▸ The leading dimension(s) ‘...’ index independent experiments (N).
+        ▸ K is the number of parameters per experiment
+          (K = 1  → single source;  K > 1 → multi-source or multi-dim).
+
+    Returns
+    -------
+    Σ̂ : (K, K) covariance matrix  (deg² or rad², same units as inputs)
+          For K = 1 this collapses to a scalar variance.
+
+    Notes
+    -----
+    • Errors wrap around at ±180° for angles in degrees, so :
+
+        e = ( (theta_hat - theta_true + 180) % 360 ) - 180   # wrap to (-180,180]
+
+    • Unbiased divisor (N-1) is used.
+    """
+    # 1. compute error
+    #e = ((theta_hat - theta_true + 180) % 360) - 180        # shape (..., K)
+    e = theta_hat - theta_true
+
+    # 2. flatten leading dims → (N, K)
+    if e.ndim == 1:                   # fast path: scalar DoA
+        return torch.var(e, unbiased=True)
+
+    #N = e.shape[0] = e.view(-1, e.shape[-1])  # (N, K)
+
+    # 3. centre & accumulate cross-products
+    e_centered = e - e.mean(dim=0, keepdim=True)
+    Σ_hat = e_centered.t().conj() @ e_centered / (e.shape[0] - 1)
+    return Σ_hat

@@ -3,10 +3,12 @@ import json
 
 import numpy as np
 import matplotlib.pyplot as plt
-import networkx as nx
-from torch.utils.data import Dataset
+import networkx as nx # Using graph for each model scene
+from torch.utils.data import Dataset #Implment the dataset
 import torch
 import os.path
+
+from tqdm import tqdm
 
 from src.utils import set_unified_seed
 from system_model import SystemModelParams
@@ -180,7 +182,7 @@ class SensorSourceGraphDataset(Dataset):
             SystemModelParams()
         ).set_params_from_json(subarray_configuration)
 
-        self.__SAMPLE_SIZE_PER_SUBARRAY = 200
+        self.__SAMPLE_SIZE_PER_SUBARRAY = 1
         self.__samples_model = Samples(self.__system_model_params)
 
         #TODO: we limit the source to be on X axis
@@ -198,7 +200,7 @@ class SensorSourceGraphDataset(Dataset):
         # Fix the domain of sources locations
         domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
 
-        for dataset_index in range(D):
+        for dataset_index in tqdm(range(D)):
 
             #TODO: pass config file for the sensors
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
@@ -206,18 +208,18 @@ class SensorSourceGraphDataset(Dataset):
                                                                                        n_sensors,
                                                                                        n_sources, sensor_positions=_sensor_position)
 
-            print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
-            draw_graph_with_precomputed_angles(model_graph)
+            #print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
+            #draw_graph_with_precomputed_angles(model_graph)
 
             samples_graphs = []
             scene_model_dataset = []
             scene_generic_dataset = []
             # Generate I-Q signals due to the sample model
-            for index in range(n_sensors):
+            for index in tqdm(range(n_sensors)):
 
                 #this is the dataset by (X, Theta) in this manner X is the signals as observed by the i'th sensor
                 subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model, samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
-                                                            true_doa=relative_angles[index])
+                                                            true_doa=np.rad2deg(relative_angles[index]))
 
                 scene_model_dataset.insert(index, copy.deepcopy(subarray_model_dataset))
                 #scene_generic_dataset.append(subarray_generic_dataset)
@@ -259,9 +261,10 @@ def test_data_creation():
     #draw_graph_with_precomputed_angles(model_graph)
 
     #print(relative_angles)
+    os.environ["TQDM_DISABLE"] = "1"
 
     dataset = SensorSourceGraphDataset(
-        D=5,
+        D=1000,
         n_sensors=n_sensors,
         n_sources=n_sources,
         d_sensor_sensor=d_sensor_sensor,

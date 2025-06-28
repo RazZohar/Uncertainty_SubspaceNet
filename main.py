@@ -147,13 +147,13 @@ if __name__ == "__main__":
 
         # Source - task based quantization
         "TRAIN_MODEL_SOURCES": False,  # Applying training operation for the sources
-        "EVALUATE_MODE_SOURCES": False,  # Evaluating desired algorithms
+        "EVALUATE_MODE_SOURCES": True,  # Evaluating desired algorithms
         "CREATE_CODEBOOK_SOURCES": False,  # Create the codebook for VQ-VAE
         "TRAIN_QUANTIZED_SOURCES": False,  # Train the model for the quantization
 
         # Online train of the model
         "TRAIN_ONLINE_SOURCES" : False,
-        "EVALUATE_ONLINE_MODE_SOURCES" : True,
+        "EVALUATE_ONLINE_MODE_SOURCES" : False,
 
         # Task ignorant quantization model
         "TRAIN_MODEL_TASK_IGNORANT": False,  # Applying training operation for the sources
@@ -1618,6 +1618,29 @@ if __name__ == "__main__":
             plot_spec=plot_spectrum_flag,
         )
 
+
+    # Check Uncertainty
+    if commands["EVALUATE_UNCERTAINTY_MODEL"]:
+        # Initialize figures dict for plotting
+        figures = initialize_figures()
+        # Define loss measure for evaluation
+        criterion, subspace_criterion = set_criterions("rmse")
+        # Load datasets for evaluation
+        if not (commands["CREATE_DATA"] or commands["LOAD_DATA"]):
+            test_dataset, generic_test_dataset, samples_model = load_datasets(
+                system_model_params=system_model_params,
+                model_type=model_config.model_type,
+                samples_size=samples_size,
+                datasets_path=datasets_path,
+                train_test_ratio=train_test_ratio,
+            )
+        # Generate DataLoader objects
+        model_test_dataset = torch.utils.data.DataLoader(
+            test_dataset, batch_size=1, shuffle=False, drop_last=False
+        )
+        generic_test_dataset = torch.utils.data.DataLoader(
+            generic_test_dataset, batch_size=1, shuffle=False, drop_last=False
+        )
 
     plt.show()
     print("end")
