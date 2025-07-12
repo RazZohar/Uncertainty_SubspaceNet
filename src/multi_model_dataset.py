@@ -9,15 +9,11 @@ import networkx as nx
 from torch.utils.data import Dataset
 import torch
 
-# Add the project root to Python path if not already there
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-if project_root not in sys.path:
-    sys.path.append(project_root)
-
-from src.utils import set_unified_seed
-from system_model import SystemModelParams
-from data_handler import create_samples
-from signal_creation import Samples
+# Use relative imports since this file is now only used as a module
+from .utils import set_unified_seed
+from .system_model import SystemModelParams
+from .data_handler import create_samples
+from .signal_creation import Samples
 
 def in_min_distance(pt, pts, d):
     return all(np.linalg.norm(pt - p) >= d for p in pts)
@@ -178,6 +174,7 @@ class SensorSourceGraphDataset(Dataset):
                  domain, configuration_file):
         self.samples_graphs = []
         self.localization_scene = []
+        self.use_graph_features = False  # Default to using original graphs
         with open(configuration_file, 'r') as f:
             subarray_configuration = json.load(f)
 
@@ -237,28 +234,49 @@ class SensorSourceGraphDataset(Dataset):
             #TODO: add the source positions?
             # self.localization_scene.insert(dataset_index, (model_graph, copy.deepcopy(samples_graphs)))
 
-            scene_model_dataset = self.collapse_samples(scene_model_dataset)            
-            self.localization_scene.insert(dataset_index, (model_graph, copy.deepcopy(scene_model_dataset)))
+            scene_model_dataset = self.collapse_samples(scene_model_dataset)
+            
+            # Pre-compute graph features for fast batching
+            sensor_positions = torch.tensor([
+                model_graph.nodes[node]['obj'].position 
+                for node in model_graph.nodes 
+                if model_graph.nodes[node]['type'] == 'sensor'
+            ], dtype=torch.float32)
+            
+            source_positions = torch.tensor([
+                model_graph.nodes[node]['obj'].position 
+                for node in model_graph.nodes 
+                if model_graph.nodes[node]['type'] == 'source'
+            ], dtype=torch.float32)
+            
+            # Store both original graph and pre-computed features
+            self.localization_scene.insert(dataset_index, (
+                model_graph, 
+                copy.deepcopy(scene_model_dataset),
+                sensor_positions,
+                source_positions
+            ))
 
     def __len__(self):
         return len(self.localization_scene)
-
-    # def __getitem__(self, idx):
-        # return self.localization_scene[idx]
-
-        # Suggestion:
-        # model_graph, scene_model_dataset = self.localization_scene[idx]
-        # return model_graph, scene_model_dataset
 
     def __getitem__(self, idx):
         """
         Returns
         -------
-        graph    : networkx.Graph
-        signals  : FloatTensor (n_arrays, N, T, n_samples)
-        doas     : FloatTensor (n_arrays, M)
+        If use_graph_features=False (default):
+            graph    : networkx.Graph
+            signals  : FloatTensor (n_arrays, N, T, n_samples)
+            doas     : FloatTensor (n_arrays, M)
+        
+        If use_graph_features=True:
+            sensor_positions : FloatTensor (n_sensors, 2)
+            source_positions : FloatTensor (n_sources, 2)
+            signals  : FloatTensor (n_arrays, N, T, n_samples)
+            doas     : FloatTensor (n_arrays, M)
         """
-        graph, sensor_list = self.localization_scene[idx]
+        graph, sensor_list, sensor_positions, source_positions = self.localization_scene[idx]
+        
         # sensor_list[j] = (X_j, Y_j) with
         #   X_j: (N, T, n_samples)
         #   Y_j: (M, 1)
@@ -269,7 +287,11 @@ class SensorSourceGraphDataset(Dataset):
         # 2) stack all Y_j, then squeeze → (n_arrays, M)
         doa_stack = torch.stack([y.squeeze(-1) for _, y in sensor_list], dim=0)
 
-        return graph, IQ_signals_stack, doa_stack
+        # Return based on the flag
+        if self.use_graph_features:
+            return sensor_positions, source_positions, IQ_signals_stack, doa_stack
+        else:
+            return graph, IQ_signals_stack, doa_stack
 
     def save_to_file(self, filename):
         path = os.path.dirname(filename)
@@ -280,6 +302,16 @@ class SensorSourceGraphDataset(Dataset):
 
     def get_sensor_potision(self):
         return self._sensor_position
+    
+    def set_use_graph_features(self, use_features=True):
+        """
+        Set whether to return pre-computed graph features or original graphs
+        
+        Args:
+            use_features (bool): If True, return tensor features for batching.
+                               If False, return original NetworkX graphs.
+        """
+        self.use_graph_features = use_features
 
     def collapse_samples(self, samples):
         """
@@ -330,41 +362,6 @@ class SensorSourceGraphDataset(Dataset):
             new_samples.append((X_stack, Y0))
 
         return new_samples
-
-
-
-def test_data_creation():
-    # Parameters
-    domain = ((0, 10), (0, 10))  # (x range, y range)
-    n_sensors = 2
-    n_sources = 2
-    d_sensor_sensor = 1.0
-    d_source_source = 1.5
-    d_sensor_source = 2.5
-
-    set_unified_seed()
-    #model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources)
-
-    #visualize_localization_scene(sensor_positions, source_positions)
-    #draw_graph_with_precomputed_angles(model_graph)
-
-    #print(relative_angles)
-
-    dataset = SensorSourceGraphDataset(
-        D=1000,
-        n_sensors=n_sensors,
-        n_sources=n_sources,
-        d_sensor_sensor=d_sensor_sensor,
-        d_source_source=d_source_source,
-        d_sensor_source=d_sensor_source,
-        domain=domain,
-        configuration_file='/home/alonhel/MBDL_MultiSubArrays/configuration/multi_model_data_config.json')
-
-    dataset.save_to_file('/home/alonhel/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
-
-    dataset_load = torch.load('/home/alonhel/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
-
-    print(dataset_load)
-
-if __name__ == '__main__':
-    test_data_creation()
+    
+if __name__ == "__main__":
+    pass

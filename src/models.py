@@ -733,6 +733,7 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
 
         self.N = N
         self.T = T
+        self.batch_size = 1 # Set using function
 
         in_channels = 8
         hidden_channels = 32
@@ -789,8 +790,11 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
     def set_quantize(self, quantize: bool):
         self.quantize_source = quantize
 
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
+
     def forward(self, x: torch.Tensor):
-        self.batch_size = x.shape[0]
+        self.set_batch_size(x.shape[0])
 
         # part of the encoder is used as the sensed device
         vq_loss, z_quantized = self.sense_device_forward(x)
