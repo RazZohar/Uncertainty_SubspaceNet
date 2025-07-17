@@ -20,10 +20,14 @@ from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 import wandb
 
+import random
+import numpy as np
+
 from src.multi_subarrays_model import MultiSubarraysModel
 from src.multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 from src.system_model import SystemModelParams
 from src.models import ModelGenerator
+from src.criterions import RMSPELoss
 
 # -----------------------------------------------------------------------------
 # collate_fn – keeps heterogeneous objects intact
@@ -48,6 +52,13 @@ class Trainer:
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
+        # ---------------- Seed ----------------
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+
         # ---------------- WandB ----------------
         wandb.init(
             project="multi-subarrays-doa",
@@ -66,7 +77,7 @@ class Trainer:
         self.train_ds, self.val_ds = random_split(
             full_ds,
             lengths=[train_len, val_len],
-            generator=torch.Generator().manual_seed(42),  # reproducible split
+            generator=torch.Generator().manual_seed(args.seed),  # reproducible split
         )
 
         self.train_loader = DataLoader(
@@ -75,6 +86,7 @@ class Trainer:
             shuffle=True,
             num_workers=args.num_workers,
             collate_fn=graph_scene_collate,
+            drop_last=True,
         )
         self.val_loader = DataLoader(
             self.val_ds,
@@ -82,6 +94,7 @@ class Trainer:
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=graph_scene_collate,
+            drop_last=True,
         )
 
         # ---------------- Model ----------------
@@ -96,8 +109,11 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma
         )
-
-        self.criterion = nn.MSELoss()
+        # TODO: ADD periodic mse loss
+        if self.args.train_doa_only:
+            self.criterion = RMSPELoss()
+        else:
+            self.criterion = nn.MSELoss()
 
         # Resume ------------------------------------------------
         if args.resume:
@@ -230,15 +246,16 @@ def parse_args():
     p.add_argument("--dataset_path", required=True)
     p.add_argument("--config_path", required=True)
     p.add_argument("--val_split", type=float, default=0.1, help="Fraction of data held out for validation")
+    p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
 
     # Training hyper‑params
     p.add_argument("--train_doa_only", action="store_true", default=False)
-    p.add_argument("--batch_size", type=int, default=5)
-    p.add_argument("--epochs", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=1024)
+    p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
-    p.add_argument("--lr_step_size", type=int, default=30)
-    p.add_argument("--lr_gamma", type=float, default=0.1)
+    p.add_argument("--lr_step_size", type=int, default=20)
+    p.add_argument("--lr_gamma", type=float, default=0.2)
     p.add_argument("--val_freq", type=int, default=5, help="Validate every N epochs")
 
     # System / misc

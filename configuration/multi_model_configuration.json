@@ -1,10 +1,10 @@
 {
-  "L": 1,
+  "L": 2,
   "subarray_config": [
     {
       "system_model": {
         "N": 8,
-        "M": 2,
+        "M": 1,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",
@@ -18,7 +18,7 @@
     {
       "system_model": {
         "N": 8,
-        "M": 2,
+        "M": 1,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",

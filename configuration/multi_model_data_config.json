@@ -1,7 +1,7 @@
 {
     "system_model": {
         "N": 8,
-        "M": 2,
+        "M": 1,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",

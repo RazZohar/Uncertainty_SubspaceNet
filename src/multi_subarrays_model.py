@@ -37,10 +37,6 @@ class MultiSubarraysModel(nn.Module):
         # Doa Assosication block
         self.rays_intersection = RayIntersection()
 
-
-
-
-
     def _load_multi_model_configuration(self, multi_model_configuration_filename):
         multi_model_configuration = json.load(open(multi_model_configuration_filename))
         return multi_model_configuration["subarray_config"], multi_model_configuration["L"]
@@ -55,7 +51,12 @@ class MultiSubarraysModel(nn.Module):
     def _create_subarray_model_by_configuration(self, subarray_configuration):
         system_model_params = SystemModelParams()
         system_model_params.set_params_from_json(subarray_configuration)
-        return SignalsSubspaceNetEsprit(N=system_model_params.N, T=system_model_params.T, tau=8, M=system_model_params.M, codebook_size=system_model_params.codebook_size)
+        return SignalsSubspaceNetEsprit(N=system_model_params.N,
+                                        T=system_model_params.T,
+                                        tau=8,
+                                        M=system_model_params.M,
+                                        codebook_size=system_model_params.codebook_size, 
+                                        quantize_source=False)
 
 
     def forward(self, sensor_location, IQ_signals_stack, gt_pos):

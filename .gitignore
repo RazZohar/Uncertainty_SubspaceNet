@@ -11,7 +11,9 @@ __pycache__/
 requirements.txt
 wandb/
 checkpoints/
-
+job-*
+MultiSubArray_train.sh
+train_multisubarrays.sh
 
 #Data
 data/*

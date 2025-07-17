@@ -19,8 +19,8 @@ def create_dataset():
     """Create and save the dataset"""
     # Parameters
     domain = ((0, 10), (0, 10))  # (x range, y range)
-    n_sensors = 1
-    n_sources = 2
+    n_sensors = 2
+    n_sources = 1
     d_sensor_sensor = 1.0
     d_source_source = 1.5
     d_sensor_source = 2.5
@@ -30,7 +30,7 @@ def create_dataset():
 
     print("Creating dataset...")
     dataset = SensorSourceGraphDataset(
-        D=1000,
+        D=50000,
         n_sensors=n_sensors,
         n_sources=n_sources,
         d_sensor_sensor=d_sensor_sensor,
