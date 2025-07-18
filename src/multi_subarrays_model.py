@@ -44,7 +44,7 @@ class MultiSubarraysModel(nn.Module):
     def create_model(self, subarray_configuration):
         for subarray_index in range(self.number_of_sensors):
             subarray_model = self._create_subarray_model_by_configuration(subarray_configuration[subarray_index])
-            subarray_model.set_batch_size(self.args.batch_size)
+            # subarray_model.set_batch_size(self.args.batch_size)
             self.subarray_models.insert(subarray_index, subarray_model)
 
 

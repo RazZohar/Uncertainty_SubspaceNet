@@ -810,6 +810,8 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         Rx_matrix = self.calculate_cov_batch(x_hat)
         # Update progressivly if enabled
         Rx_matrix = self.calculate_progressive_coveriance(Rx_matrix)
+
+        self.set_batch_size(x_hat.shape[0])
         # Apply Gram operation diagonal loading
         # Rz = gram_diagonal_overload(
         #    Kx=Rx_matrix, eps=1, batch_size=self.batch_size
