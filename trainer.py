@@ -252,8 +252,8 @@ def parse_args():
 
     # Training hyper‑params
     p.add_argument("--train_doa_only", action="store_true", default=False)
-    p.add_argument("--batch_size", type=int, default=1024)
-    p.add_argument("--val_batch_size", type=int, default=100)
+    p.add_argument("--batch_size", type=int, default=1000)
+    p.add_argument("--val_batch_size", type=int, default=1000)
     p.add_argument("--epochs", type=int, default=50)
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
