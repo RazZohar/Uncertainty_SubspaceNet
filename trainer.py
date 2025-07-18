@@ -90,7 +90,7 @@ class Trainer:
         )
         self.val_loader = DataLoader(
             self.val_ds,
-            batch_size=args.batch_size,
+            batch_size=args.val_batch_size,
             shuffle=False,
             num_workers=args.num_workers,
             collate_fn=graph_scene_collate,
