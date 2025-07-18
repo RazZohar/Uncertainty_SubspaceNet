@@ -163,8 +163,10 @@ class Trainer:
     def _loop(self, loader, train: bool):
         if train:
             self.model.train()
+            batch_size = self.args.batch_size
         else:
             self.model.eval()
+            batch_size = self.args.val_batch_size
 
         running = 0.0
         pos_gt = None
@@ -196,7 +198,7 @@ class Trainer:
 
                 running += loss.item()
 
-        return running / (len(loader) * self.args.batch_size)
+        return running / (len(loader) * batch_size)
 
     # expose convenience wrappers
     def train_epoch(self):
