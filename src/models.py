@@ -1458,7 +1458,7 @@ def doa_covariance_from_eig(evals, evecs, thetas, N, d=0.5):
     eps = torch.linalg.eigvalsh(G).real.amax(dim=-1, keepdim=True) * 1e-6
     Ginv = torch.linalg.inv(G + eps.unsqueeze(-1) * torch.eye(r, device=G.device))
     # -----------------------------------------------
-    # Yuen & Friedlander (eq. )
+    # Yuen & Friedlander (eq. ★)
     if torch.is_tensor(N):
         N = N.to(device).view(B, 1, 1)
 
