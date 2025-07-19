@@ -1,19 +1,20 @@
 import copy
 import json
+import os
+import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
-import networkx as nx # Using graph for each model scene
-from torch.utils.data import Dataset #Implment the dataset
+import networkx as nx
+from torch.utils.data import Dataset
 import torch
 import os.path
 
-from tqdm import tqdm
-
-from src.utils import set_unified_seed
-from system_model import SystemModelParams
-from data_handler import create_samples
-from signal_creation import Samples
+# Use relative imports since this file is now only used as a module
+from .utils import set_unified_seed
+from .system_model import SystemModelParams
+from .data_handler import create_samples
+from .signal_creation import Samples
 
 def in_min_distance(pt, pts, d):
     return all(np.linalg.norm(pt - p) >= d for p in pts)
@@ -174,6 +175,7 @@ class SensorSourceGraphDataset(Dataset):
                  domain, configuration_file):
         self.samples_graphs = []
         self.localization_scene = []
+        self.use_graph_features = False  # Default to using original graphs
         with open(configuration_file, 'r') as f:
             subarray_configuration = json.load(f)
 
@@ -187,7 +189,7 @@ class SensorSourceGraphDataset(Dataset):
 
         #TODO: we limit the source to be on X axis
         source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
-        _sensor_position = generate_points_with_gap(
+        self._sensor_position = generate_points_with_gap(
             n_points=n_sensors,
             d_self=d_sensor_sensor,
             domain=source_domain
@@ -196,11 +198,11 @@ class SensorSourceGraphDataset(Dataset):
 
 
         # Put the sources in front of the sensors
-        y_max = max(_sensor_position, key=lambda x:x[1])[1]
+        y_max = max(self._sensor_position, key=lambda x:x[1])[1]
         # Fix the domain of sources locations
         domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
 
-        for dataset_index in tqdm(range(D)):
+        for dataset_index in range(D):
 
             #TODO: pass config file for the sensors
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
@@ -208,33 +210,88 @@ class SensorSourceGraphDataset(Dataset):
                                                                                        n_sensors,
                                                                                        n_sources, sensor_positions=_sensor_position)
 
-            #print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
-            #draw_graph_with_precomputed_angles(model_graph)
+            print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
+            # draw_graph_with_precomputed_angles(model_graph)
 
             samples_graphs = []
             scene_model_dataset = []
             scene_generic_dataset = []
             # Generate I-Q signals due to the sample model
-            for index in tqdm(range(n_sensors)):
+            for index in range(n_sensors):
 
                 #this is the dataset by (X, Theta) in this manner X is the signals as observed by the i'th sensor
                 subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model, samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
-                                                            true_doa=np.rad2deg(relative_angles[index]))
+                                                            true_doa=relative_angles[index])
 
+                # Convert to tensor during data generation
                 scene_model_dataset.insert(index, copy.deepcopy(subarray_model_dataset))
                 #scene_generic_dataset.append(subarray_generic_dataset)
 
 
 
-            samples_graphs.insert(dataset_index, copy.deepcopy(scene_model_dataset))
+            # samples_graphs.insert(dataset_index, copy.deepcopy(scene_model_dataset))
 
-            self.localization_scene.insert(dataset_index, (model_graph, copy.deepcopy(samples_graphs)))
+            #TODO: add the source positions?
+            # self.localization_scene.insert(dataset_index, (model_graph, copy.deepcopy(samples_graphs)))
+
+            scene_model_dataset = self.collapse_samples(scene_model_dataset)
+
+            # Pre-compute graph features for fast batching
+            sensor_positions = torch.tensor([
+                model_graph.nodes[node]['obj'].position
+                for node in model_graph.nodes
+                if model_graph.nodes[node]['type'] == 'sensor'
+            ], dtype=torch.float32)
+
+            source_positions = torch.tensor([
+                model_graph.nodes[node]['obj'].position
+                for node in model_graph.nodes
+                if model_graph.nodes[node]['type'] == 'source'
+            ], dtype=torch.float32)
+
+            # Store both original graph and pre-computed features
+            self.localization_scene.insert(dataset_index, (
+                model_graph,
+                copy.deepcopy(scene_model_dataset),
+                sensor_positions,
+                source_positions
+            ))
 
     def __len__(self):
         return len(self.localization_scene)
 
     def __getitem__(self, idx):
-        return self.localization_scene[idx]
+        """
+        Returns
+        -------
+        If use_graph_features=False (default):
+            graph    : networkx.Graph
+            signals  : FloatTensor (n_arrays, N, T, n_samples)
+            doas     : FloatTensor (n_arrays, M)
+
+        If use_graph_features=True:
+            sensor_positions : FloatTensor (n_sensors, 2)
+            source_positions : FloatTensor (n_sources, 2)
+            signals  : FloatTensor (n_arrays, N, T, n_samples)
+            doas     : FloatTensor (n_arrays, M)
+        """
+        graph, sensor_list, sensor_positions, source_positions = self.localization_scene[idx]
+
+        # sensor_list[j] = (X_j, Y_j) with
+        #   X_j: (N, T, n_samples)
+        #   Y_j: (M, 1)
+
+        # 1) stack all X_j → (n_arrays, N, T, n_samples)
+        IQ_signals_stack = torch.stack([x for x, _ in sensor_list], dim=0)
+
+        # 2) stack all Y_j, then squeeze → (n_arrays, M)
+        doa_stack = torch.stack([y.squeeze(-1) for _, y in sensor_list], dim=0)
+
+        # Return based on the flag
+        if self.use_graph_features:
+            return sensor_positions, source_positions, IQ_signals_stack, doa_stack
+        else:
+            return graph, IQ_signals_stack, doa_stack
 
     def save_to_file(self, filename):
         path = os.path.dirname(filename)
@@ -243,41 +300,68 @@ class SensorSourceGraphDataset(Dataset):
             print(f"Created path: {path}")
         torch.save(self, filename)
 
+    def get_sensor_potision(self):
+        return self._sensor_position
 
+    def set_use_graph_features(self, use_features=True):
+        """
+        Set whether to return pre-computed graph features or original graphs
 
-def test_data_creation():
-    # Parameters
-    domain = ((0, 10), (0, 10))  # (x range, y range)
-    n_sensors = 2
-    n_sources = 1
-    d_sensor_sensor = 1.0
-    d_source_source = 1.5
-    d_sensor_source = 2.5
+        Args:
+            use_features (bool): If True, return tensor features for batching.
+                               If False, return original NetworkX graphs.
+        """
+        self.use_graph_features = use_features
 
-    set_unified_seed()
-    #model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources)
+    def collapse_samples(self, samples):
+        """
+        Convert the current structure
 
-    #visualize_localization_scene(sensor_positions, source_positions)
-    #draw_graph_with_precomputed_angles(model_graph)
+            samples[sensor][sample] = (X, Y)
 
-    #print(relative_angles)
-    os.environ["TQDM_DISABLE"] = "1"
+        into
 
-    dataset = SensorSourceGraphDataset(
-        D=1000,
-        n_sensors=n_sensors,
-        n_sources=n_sources,
-        d_sensor_sensor=d_sensor_sensor,
-        d_source_source=d_source_source,
-        d_sensor_source=d_sensor_source,
-        domain=domain,
-        configuration_file='../configuration/multi_model_data_config.json')
+            samples[sensor] = (X_stack, Y0)
 
-    dataset.save_to_file('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
+        where
+            X_stack : (N, T, n_samples)
+            Y0      : (M, 1)
 
-    dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
+        Args
+        ----
+        samples : list  # len = n_sensors
+            Each item is a list of length n_samples with (X, Y) tuples.
 
-    print(dataset_load)
+        Returns
+        -------
+        new_samples : list            # len = n_sensors
+            Each item is a tuple (X_stack, Y0) as described above.
+        """
+        new_samples = []
 
-if __name__ == '__main__':
-    test_data_creation()
+        for sensor_idx, sensor_list in enumerate(samples):
+            # 1) Split the tuples
+            X_list, Y_list = zip(*sensor_list)      # tuples of tensors
+
+            # 2) Stack X along a **new third axis**
+            #    Each X_list[k] is (N, T) → unsqueeze(-1) → (N, T, 1)
+            X_pc = torch.cat(
+                [x.unsqueeze(-1) for x in X_list],  # cat on last dim
+                dim=-1                              # (N, T, n_samples)
+            )
+
+            X_stack = X_pc.permute(2, 0, 1).contiguous()
+
+            # 3) Ensure all Y are identical, keep the first
+            Y0 = Y_list[0]
+            if not all(torch.equal(y, Y0) for y in Y_list[1:]):
+                raise ValueError(
+                    f"Sensor {sensor_idx}: Y labels differ across snapshots."
+                )
+
+            new_samples.append((X_stack, Y0))
+
+        return new_samples
+
+if __name__ == "__main__":
+    pass

@@ -2,9 +2,9 @@
 Details
 ----------
 Name: models.py
-Authors: New by Raz Zohar
+Authors: Dor Haim Shmuel
 Created: 01/10/21
-Edited: 22/06/2025
+Edited: 02/06/23
 
 Purpose:
 --------
@@ -592,13 +592,12 @@ class SubspaceNet(nn.Module):
         )  # Shape: [Batch size, N, N]
         # Feed surrogate covariance to the differentiable subspace algorithm
         method_output = self.diff_method(Rz, self.M, self.batch_size)
-        if isinstance(method_output, tuple) and len(method_output[0]) > 1:
+        if isinstance(method_output, tuple):
             # Root MUSIC output
-            doas, subspace_info = method_output
-            doa_prediction, doa_all_predictions, roots = doas
+            doa_prediction, doa_all_predictions, roots = method_output
         else:
             # Esprit output
-            doa_prediction, subspace_information = method_output
+            doa_prediction = method_output
             doa_all_predictions, roots = None, None
         return doa_prediction, doa_all_predictions, roots, Rz, vq_loss
 
@@ -735,6 +734,7 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
 
         self.N = N
         self.T = T
+        self.batch_size = 1 # Set using function
 
         in_channels = 8
         hidden_channels = 32
@@ -791,8 +791,11 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
     def set_quantize(self, quantize: bool):
         self.quantize_source = quantize
 
-    def forward(self, x: torch.Tensor):
+    def set_batch_size(self, batch_size: int):
+        self.batch_size = batch_size
 
+    def forward(self, x: torch.Tensor):
+        self.set_batch_size(x.shape[0])
 
         # part of the encoder is used as the sensed device
         vq_loss, z_quantized = self.sense_device_forward(x)
@@ -808,6 +811,8 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         Rx_matrix = self.calculate_cov_batch(x_hat)
         # Update progressivly if enabled
         Rx_matrix = self.calculate_progressive_coveriance(Rx_matrix)
+
+        self.set_batch_size(x_hat.shape[0])
         # Apply Gram operation diagonal loading
         # Rz = gram_diagonal_overload(
         #    Kx=Rx_matrix, eps=1, batch_size=self.batch_size
@@ -832,7 +837,6 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         return Rz, doa_prediction
 
     def sense_device_forward(self, x):
-        self.batch_size = x.shape[0]
         x_e = self.encoder_signal(x)
         # Quantize
         x_normalized = x_e - x_e.mean()

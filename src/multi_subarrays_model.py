@@ -4,15 +4,11 @@ import copy
 import json
 import numpy as np
 
-from system_model import SystemModelParams
-from models import SignalsSubspaceNetEsprit
-from multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
-from learned_agg_layer import LearnedAgg
-
-from localization_block import RayIntersection
-
-POSITION_2D = 2
-
+from .system_model import SystemModelParams
+from .models import SignalsSubspaceNetEsprit
+from .multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
+from .localization_block import RayIntersection
+from .learned_agg_layer import LearnedAgg
 
 def get_location_from_model_graph(model_graph, type_req='sensor'):
     """
@@ -24,12 +20,12 @@ def get_location_from_model_graph(model_graph, type_req='sensor'):
 
 
 class MultiSubarraysModel(nn.Module):
-    def __init__(self, sensors_positions, multi_model_configuration):
+    def __init__(self, sensors_positions, multi_model_configuration,args):
         super(MultiSubarraysModel, self).__init__()
 
 
         self.sensors_graph = sensors_positions
-
+        self.args = args
         subarrays_config, self.number_of_sensors = self._load_multi_model_configuration(multi_model_configuration)
 
         self.subarray_models = nn.ModuleList()
@@ -54,6 +50,7 @@ class MultiSubarraysModel(nn.Module):
     def create_model(self, subarray_configuration):
         for subarray_index in range(self.number_of_sensors):
             subarray_model = self._create_subarray_model_by_configuration(subarray_configuration[subarray_index])
+            # subarray_model.set_batch_size(self.args.batch_size)
             self.subarray_models.insert(subarray_index, subarray_model)
 
             # Add the learned attentaion layer
@@ -63,37 +60,59 @@ class MultiSubarraysModel(nn.Module):
     def _create_subarray_model_by_configuration(self, subarray_configuration):
         system_model_params = SystemModelParams()
         system_model_params.set_params_from_json(subarray_configuration)
-        return SignalsSubspaceNetEsprit(N=system_model_params.N, T=system_model_params.T, tau=8, M=system_model_params.M, codebook_size=system_model_params.codebook_size)
+        return SignalsSubspaceNetEsprit(N=system_model_params.N,
+                                        T=system_model_params.T,
+                                        tau=8,
+                                        M=system_model_params.M,
+                                        codebook_size=system_model_params.codebook_size,
+                                        quantize_source=False)
 
 
-    def forward(self, localization_scene):
-        model_graph, samples = localization_scene
-        sensor_location = get_location_from_model_graph(model_graph)
+    def forward(self, sensor_location, IQ_signals_stack, gt_pos):
 
-        q_i = []
-        for subarray_index in range(self.number_of_sensors):
-            iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
-            vq_loss, q = self.subarray_models[subarray_index].sense_device_forward(iq_signals.unsqueeze(0))
-            q_i.insert(subarray_index, q)
-
-        stacked_words = torch.stack([i.squeeze(0) for i in q_i], dim=0)
-
-        #TODO: "Attentaion" for the fusion between subarrrays
-        #z_i = []
-        #for subarray_index in range(self.number_of_sensors):
-        #    z, phi = self.learned_attentaion[subarray_index].forward(stacked_words.unsqueeze(0), torch.Tensor(sensor_location).unsqueeze(0))
-        #    z_i.insert(subarray_index, z)
+        # sensor_location = get_location_from_model_graph(model_graph)
 
         bearings = []
+        q_i = []
         for subarray_index in range(self.number_of_sensors):
-            R, estimated_angles = self.subarray_models[subarray_index].inference_device_forward(q_i[subarray_index])
-            bearings.insert(subarray_index, estimated_angles)
+            # Original
+            # iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
+
+            # With new dataset
+            # iq_signals is now a tensor with dim of (B, n_arrays, __SAMPLE_SIZE_PER_SUBARRAY,N,T)
+            # if you want only one sample for sub array (as in the code before) just use iq_signals[0]
+            iq_signals = IQ_signals_stack[:,subarray_index,0,:,:] # (B, N, T)
+
+            # FIXME: gt_pos shouldn't be here, this is the ground truth position of the source,
+            # should be in the training loop only
+            # doa is now a tensor of dimension [B, M - Number of sources]. Each entry is the direction
+            # of source i from sensor array [subarray_index]
+            doa = gt_pos[:,subarray_index]
+
+            #Suggestion:
+            # rand_idx = torch.randint(0, len(samples[subarray_index]), (1,)).item()
+            # iq_signal, doa = samples[subarray_index][rand_idx]
+
+            vq_loss , q_quantized = self.subarray_models[subarray_index].sense_device_forward(iq_signals)
+            q_i.append(q_quantized)
+
+        q_i_stack = torch.stack(q_i, dim=1)
+
+        # TODO: add attention between subarrays
+
+        for subarray_index in range(self.number_of_sensors):
+            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+            bearings.append(doa_pred)
+
+        bearings = torch.stack(bearings, dim=1)
+
+        if self.args.train_doa_only:
+            return bearings
 
         #TODO: Assosicate angles
 
         # Intersect rays
-
-        source_estimated_position, dop = self.rays_intersection.forward(np.array(sensor_location), torch.Tensor(bearings))
+        source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings)
         return source_estimated_position
 
 

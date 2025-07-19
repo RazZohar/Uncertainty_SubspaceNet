@@ -160,7 +160,7 @@ def create_samples(model_type, phase, samples_model, samples_size, tau, true_doa
         else:
             X_model = X
         # Ground-truth creation
-        Y = torch.tensor(samples_model.doa, dtype=torch.float64).to(device)
+        Y = torch.tensor(samples_model.doa, dtype=torch.float32).to(device)
         generic_dataset.append((X, Y))
         model_dataset.append((X_model, Y))
 
