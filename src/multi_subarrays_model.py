@@ -54,7 +54,7 @@ class MultiSubarraysModel(nn.Module):
             self.subarray_models.insert(subarray_index, subarray_model)
 
             # Add the learned attentaion layer
-            self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors, POSITION_2D))
+            self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
 
 
     def _create_subarray_model_by_configuration(self, subarray_configuration):
@@ -99,9 +99,14 @@ class MultiSubarraysModel(nn.Module):
         q_i_stack = torch.stack(q_i, dim=1)
 
         # TODO: add attention between subarrays
-
+        z_i = []
         for subarray_index in range(self.number_of_sensors):
-            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+            z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
+            z_i.insert(subarray_index, z)
+
+        z_i_stack = torch.stack(z_i, dim=1)
+        for subarray_index in range(self.number_of_sensors):
+            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(z_i_stack[:,subarray_index,:,:])
             bearings.append(doa_pred)
 
         bearings = torch.stack(bearings, dim=1)

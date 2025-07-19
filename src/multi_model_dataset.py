@@ -208,7 +208,7 @@ class SensorSourceGraphDataset(Dataset):
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
                                                                                        d_source_source, domain,
                                                                                        n_sensors,
-                                                                                       n_sources, sensor_positions=_sensor_position)
+                                                                                       n_sources, sensor_positions=self._sensor_position)
 
             print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
             # draw_graph_with_precomputed_angles(model_graph)
