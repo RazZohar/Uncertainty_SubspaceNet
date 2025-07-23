@@ -87,7 +87,7 @@ class MultiSubarraysModel(nn.Module):
             # should be in the training loop only
             # doa is now a tensor of dimension [B, M - Number of sources]. Each entry is the direction
             # of source i from sensor array [subarray_index]
-            doa = gt_pos[:,subarray_index]
+            #doa = gt_pos[:,subarray_index]
 
             #Suggestion:
             # rand_idx = torch.randint(0, len(samples[subarray_index]), (1,)).item()
@@ -111,14 +111,19 @@ class MultiSubarraysModel(nn.Module):
 
         bearings = torch.stack(bearings, dim=1)
 
+
+        #TODO: Assosicate angles
+
+        source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
+
         if self.args.train_doa_only:
-            return bearings
+            return bearings, source_estimated_position, dop
 
         #TODO: Assosicate angles
 
         # Intersect rays
-        source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings)
-        return source_estimated_position
+        return bearings, source_estimated_position, dop
+        #return source_estimated_position
 
 
 if __name__ == '__main__':

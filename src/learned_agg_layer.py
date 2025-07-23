@@ -6,7 +6,7 @@ import math
 class LearnedAgg(nn.Module):
     def __init__(self, sensor_count):
         super().__init__()
-        self.w = None  # lazy init
+        self.w = nn.Parameter(torch.empty(0), requires_grad=True)
         self.d_token = None
         self.L = sensor_count
 
@@ -31,7 +31,8 @@ class LearnedAgg(nn.Module):
         d_token = x.shape[-1]
 
         # Step 3: lazy init of weight vector
-        if self.w is None or self.d_token != d_token:
+        #if self.w is None or self.d_token != d_token:
+        if self.w.numel() == 0:
             std = 1.0 / math.sqrt(d_token)
             real = torch.empty(d_token, dtype=torch.float32, device=x.device).uniform_(-std, std)
             imag = torch.empty(d_token, dtype=torch.float32, device=x.device).uniform_(-std, std)
@@ -48,3 +49,37 @@ class LearnedAgg(nn.Module):
         z = (phi.unsqueeze(-1).unsqueeze(-1) * q).sum(dim=1)  # (B, H, W)
 
         return z, phi
+
+
+def match_learned_attn_shapes(model, state_dict, prefix="learned_attentaion"):
+    for name, param in state_dict.items():
+        if name.startswith(prefix) and name.endswith(".w"):
+            parts = name.split(".")
+            idx = int(parts[1])
+            shape = param.shape
+            dtype = param.dtype
+            device = param.device
+
+            mod = getattr(model, prefix)[idx]
+
+            needs_replacement = (
+                not hasattr(mod, "w") or
+                not isinstance(mod.w, torch.nn.Parameter) or
+                mod.w.shape != shape or
+                mod.w.dtype != dtype
+            )
+
+            if needs_replacement:
+                if dtype.is_complex:
+                    # Complex init: match your training init
+                    d_token = shape[-1]
+                    std = 1.0 / math.sqrt(d_token)
+                    real = torch.empty(shape, dtype=torch.float32, device=device).uniform_(-std, std)
+                    imag = torch.empty(shape, dtype=torch.float32, device=device).uniform_(-std, std)
+                    w = torch.complex(real, imag)
+                else:
+                    # Real-valued init
+                    w = torch.empty(shape, dtype=dtype, device=device)
+                    torch.nn.init.xavier_uniform_(w)
+
+                mod.w = torch.nn.Parameter(w)

@@ -3,37 +3,58 @@ import torch.nn as nn
 
 class RayIntersection(nn.Module):
     """
-    Least-squares intersection of M 2-D rays.
-    Inputs
-    ------
-    positions : (M,2) tensor of (x_i, y_i)
-    bearings  : (M,)  tensor of theta_i  [rad]
+    Batched least-squares intersection of 2D rays.
+    No learnable parameters. Fully differentiable output (x_hat).
+    GDOP is detached from autograd for safe logging.
 
-    Returns
+    Inputs:
     -------
-    x_hat : (2,)   estimated intersection point
-    gdop  : scalar geometric dilution of precision
+    positions : (B, M, 2) - sensor positions
+    bearings  : (B, M) or (B, M, 1) - angles [rad]
+
+    Returns:
+    --------
+    x_hat : (B, 2) - estimated intersection point
+    gdop  : (B,)   - geometric dilution of precision (no gradients)
     """
-    def forward(self, positions, bearings, eps=1e-9):
-        sensor_count, pos_dim = positions.shape
+    def __init__(self, compute_gdop: bool = True, eps: float = 1e-6):
+        super().__init__()
+        self.compute_gdop = compute_gdop
+        self.eps = eps
 
-        # Copy -pi/2, pi/2 to [0,pi]
-        bearings = torch.remainder(bearings + torch.pi / 2, torch.pi)
+    def forward(self, positions: torch.Tensor, bearings: torch.Tensor):
+        B, M, _ = positions.shape
+        eps = self.eps
 
-        # Unit direction vectors
-        d = torch.stack((torch.cos(bearings), torch.sin(bearings)), dim=1)  # (M,2)
+        if bearings.ndim == 3:
+            bearings = bearings.squeeze(-1)  # ensure (B, M)
 
-        # Perpendiculars (+90° rotation)
-        d_perp = torch.stack((-d[:,1], d[:,0]), dim=1)                      # (M,2)
+        # Adjust bearings into [0, pi]
+        #bearings = torch.remainder(bearings + torch.pi / 2, torch.pi)
 
-        # Build normal equations
-        A = d_perp.T @ d_perp                                               # (2,2)
-        c = (d_perp * positions).sum(dim=1)                                 # (M,)
-        b = d_perp.T @ c.float()                                                    # (2,)
+        # Unit direction vectors (B, M, 2)
+        d = torch.stack((torch.cos(bearings), torch.sin(bearings)), dim=-1)
 
-        # Regularised inverse for numerical stability
-        x_hat = torch.linalg.solve(A + eps*torch.eye(pos_dim, device=A.device), b)   # (2,)
+        # Rotate 90° to get perpendiculars
+        d_perp = torch.stack((-d[..., 1], d[..., 0]), dim=-1)  # (B, M, 2)
 
-        # GDOP
-        gdop = torch.sqrt(torch.trace(torch.linalg.inv(A + eps*torch.eye(pos_dim))))
+        # Normal equations: A @ x = b
+        A = d_perp.transpose(1, 2) @ d_perp                    # (B, 2, 2)
+        c = (d_perp * positions).sum(dim=2)                    # (B, M)
+        b = d_perp.transpose(1, 2) @ c.unsqueeze(-1)           # (B, 2, 1)
+        b = b.squeeze(-1)
+
+        I = torch.eye(2, device=positions.device).expand(B, 2, 2)
+        A_reg = A + eps * I
+        A_inv = torch.linalg.pinv(A_reg)                      # safe inverse
+        x_hat = (A_inv @ b.unsqueeze(-1)).squeeze(-1)         # differentiable
+
+        # GDOP: trace(inv(A)), detached
+        if self.compute_gdop:
+            with torch.no_grad():
+                trace = A_inv.diagonal(dim1=-2, dim2=-1).sum(-1)  # (B,)
+                gdop = torch.sqrt(trace)
+        else:
+            gdop = None
+
         return x_hat, gdop

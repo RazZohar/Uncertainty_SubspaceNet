@@ -28,29 +28,59 @@ def create_dataset():
     print("Setting unified seed...")
     set_unified_seed()
 
+    DATASET_TRAIN_SIZE = 50000
+    #DATASET_TRAIN_SIZE = 5
+    DATASET_TEST_SIZE = int(DATASET_TRAIN_SIZE * 0.1)
+
     print("Creating dataset...")
     dataset = SensorSourceGraphDataset(
-        D=50000,
+        D=DATASET_TRAIN_SIZE,
         n_sensors=n_sensors,
         n_sources=n_sources,
         d_sensor_sensor=d_sensor_sensor,
         d_source_source=d_source_source,
         d_sensor_source=d_sensor_source,
         domain=domain,
-        configuration_file='/home/alonhel/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
+        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
     )
 
     print("Saving dataset...")
-    dataset.save_to_file('/home/alonhel/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
-    
+    dataset.save_to_file('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
+
     print("Loading dataset to verify...")
-    dataset_load = torch.load('/home/alonhel/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
-    
+    dataset_load = torch.load('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
+
+    print("Creating test dataset...")
+    dataset = SensorSourceGraphDataset(
+        D=DATASET_TEST_SIZE,
+        n_sensors=n_sensors,
+        n_sources=n_sources,
+        d_sensor_sensor=d_sensor_sensor,
+        d_source_source=d_source_source,
+        d_sensor_source=d_sensor_source,
+        domain=domain,
+        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
+    )
+
+    print("Saving dataset...")
+    dataset.save_to_file(
+        '/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset_test.pkl')
+
     print("Dataset created successfully!")
     print(f"Dataset length: {len(dataset_load)}")
     print(f"Number of sensors: {n_sensors}")
     print(f"Number of sources: {n_sources}")
     print(dataset_load)
+    print(dataset_load.__getitem__(0))
+
+    dataset_load.use_graph_features = True
+    for idx, item in enumerate(dataset_load):
+        if item[1][0][0] > 8:
+            print(item[1])
+            print(idx)
+            break
+#        if idx > 200:
+#            break
 
 if __name__ == '__main__':
     create_dataset() 

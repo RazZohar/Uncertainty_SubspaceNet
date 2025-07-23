@@ -199,8 +199,13 @@ class SensorSourceGraphDataset(Dataset):
 
         # Put the sources in front of the sensors
         y_max = max(self._sensor_position, key=lambda x:x[1])[1]
+
+        # Put the sources at RHS of the sensor in order to allow -pi/2,pi/2
+        x_min = max(self._sensor_position, key=lambda x: x[0])[0]
+
         # Fix the domain of sources locations
-        domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
+        #domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
+        domain = (x_min, domain[0][1]), (y_max, domain[1][1])
 
         for dataset_index in range(D):
 
@@ -216,6 +221,7 @@ class SensorSourceGraphDataset(Dataset):
             samples_graphs = []
             scene_model_dataset = []
             scene_generic_dataset = []
+            relative_angles = np.degrees(relative_angles)
             # Generate I-Q signals due to the sample model
             for index in range(n_sensors):
 

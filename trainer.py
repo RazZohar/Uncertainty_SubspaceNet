@@ -178,7 +178,7 @@ class Trainer:
                 sensor_positions = sensor_positions.to(self.device)
                 source_positions = source_positions.to(self.device)
                 samples = samples.to(self.device)
-                doa_gt = doa_gt.to(self.device)
+                doa_gt = np.radians(doa_gt.to(self.device))
 
                 if train:
                     self.optimizer.zero_grad()
@@ -186,11 +186,11 @@ class Trainer:
                 # gt_pos is now a tensor of dimension [M - Number of sources]. Each entry is the direction
                 # of source i from sensor array [subarray_index]
                 if self.args.train_doa_only:
-                    doa_pred = self.model(sensor_positions, samples, doa_gt)
+                    doa_pred, pos_pred, dop = self.model(sensor_positions, samples, doa_gt)
                     loss = self.criterion(doa_pred, doa_gt)
                 else:
-                    pos_pred = self.model(sensor_positions, samples, pos_gt)
-                    loss = self.criterion(pos_pred, pos_gt)
+                    doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
+                    loss = self.criterion(pos_pred, source_positions.squeeze(-2))
 
                 if train:
                     loss.backward()
@@ -234,7 +234,63 @@ class Trainer:
                 self._save_checkpoint(epoch, is_best=False)
                 print(f"[Epoch {epoch:03d}] train={train_loss:.6f}")
 
+            if self.args.visualize:
+                self._visualize_fixed_sample(sample_idx=self.args.visualize_sample_index, epoch=epoch, batch_size=self.args.batch_size)
+
         wandb.finish()
+
+        # Create the GIF
+        if self.args.visualize:
+            from src.visualization import create_sample_gif
+            create_sample_gif(sample_idx=self.args.visualize_sample_index)
+
+    # ---------------------------------------------------------------------
+    def get_fixed_batch(self, batch_size=100, start_index=0):
+        # Subset maps logical index → real dataset index
+        subset_indices = self.train_ds.indices[start_index: start_index + batch_size]
+
+        # Get raw samples from dataset using real indices
+        samples = [self.train_ds.dataset[i] for i in subset_indices]  # list of tuples
+
+        # Collate using the same logic as DataLoader
+        batch = graph_scene_collate(samples)
+
+        # Move to device
+        batch = tuple(x.to(self.device) if torch.is_tensor(x) else x for x in batch)
+
+        return batch
+
+    def _visualize_fixed_sample(self, sample_idx: int, epoch: int, batch_size):
+        from src.visualization import visualize_ray_frame
+
+        # Get the specific item directly from the full dataset (not the split subset!)
+        batch = self.get_fixed_batch(batch_size=batch_size, start_index=0)
+        sensor_pos, source_pos, iq_signal, doa_gt = batch
+
+        sensor_pos = sensor_pos.to(self.device)  # (1, M, 2)
+        source_pos = source_pos.to(self.device)  # (1, 1, 2)
+        iq_signal = iq_signal.to(self.device)  # (1, ...)
+        doa_gt = doa_gt.to(self.device)
+
+        with torch.no_grad():
+            doa_pred, pos_pred, _ = self.model(sensor_pos, iq_signal, doa_gt)
+
+        visualize_ray_frame(
+            positions=sensor_pos[1],  # (M, 2)
+            bearings=doa_pred[1],  # (M,)
+            x_hat=pos_pred[1],  # (2,)
+            x_true=source_pos[1, 0],  # (2,)
+            step=epoch,
+            save_path=f"visualizations/sample_{sample_idx:03d}_epoch_{epoch:03d}.png"
+        )
+        import wandb
+        wandb.log({"epoch": epoch, "doa_pred": doa_pred[0], "pos_pred": pos_pred[0], "doa_gt": doa_gt[0], "pos_gt": source_pos[0, 0]})
+        if self.args.visualize and self.args.log_to_wandb:
+
+            wandb.log({
+                f"viz/sample_{sample_idx}/epoch_{epoch:03d}":
+                    wandb.Image(f"visualizations/sample_{sample_idx:03d}_epoch_{epoch:03d}.png")
+            })
 
 
 # -----------------------------------------------------------------------------
@@ -265,6 +321,11 @@ def parse_args():
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")
     p.add_argument("--resume", type=str, default=None)
+
+    #Visualization
+    p.add_argument("--visualize", action="store_true", help="Enable per-epoch sample visualization")
+    p.add_argument("--visualize_sample_index", type=int, default=0, help="Index of the sample to track")
+    p.add_argument("--log_to_wandb", action="store_true", help="Log visualizations to W&B")
 
     return p.parse_args()
 
