@@ -187,6 +187,7 @@ class Trainer:
                 # of source i from sensor array [subarray_index]
                 if self.args.train_doa_only:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, doa_gt)
+                    doa_pred = doa_pred.squeeze(dim=-1)
                     loss = self.criterion(doa_pred, doa_gt)
                 else:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
@@ -195,6 +196,7 @@ class Trainer:
                 if train:
                     loss.backward()
                     self.optimizer.step()
+                    self.model.zero_grad()
 
                 running += loss.item()
 
@@ -275,16 +277,17 @@ class Trainer:
         with torch.no_grad():
             doa_pred, pos_pred, _ = self.model(sensor_pos, iq_signal, doa_gt)
 
-        visualize_ray_frame(
-            positions=sensor_pos[1],  # (M, 2)
-            bearings=doa_pred[1],  # (M,)
-            x_hat=pos_pred[1],  # (2,)
-            x_true=source_pos[1, 0],  # (2,)
-            step=epoch,
-            save_path=f"visualizations/sample_{sample_idx:03d}_epoch_{epoch:03d}.png"
-        )
-        import wandb
-        wandb.log({"epoch": epoch, "doa_pred": doa_pred[0], "pos_pred": pos_pred[0], "doa_gt": doa_gt[0], "pos_gt": source_pos[0, 0]})
+        for sample_index in range(5):
+            visualize_ray_frame(
+                positions=sensor_pos[sample_index],  # (M, 2)
+                bearings=doa_pred[sample_index],  # (M,)
+                x_hat=pos_pred[sample_index],  # (2,)
+                x_true=source_pos[sample_index, 0],  # (2,)
+                step=epoch,
+                save_path=f"visualizations/sample_{sample_index:03d}_epoch_{epoch:03d}.png"
+            )
+            import wandb
+            wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index], "pos_pred": pos_pred[sample_index], "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
         if self.args.visualize and self.args.log_to_wandb:
 
             wandb.log({
@@ -308,14 +311,14 @@ def parse_args():
 
     # Training hyper‑params
     p.add_argument("--train_doa_only", action="store_true", default=False)
-    p.add_argument("--batch_size", type=int, default=1000)
-    p.add_argument("--val_batch_size", type=int, default=100)
-    p.add_argument("--epochs", type=int, default=50)
+    p.add_argument("--batch_size", type=int, default=1024)
+    p.add_argument("--val_batch_size", type=int, default=1024)
+    p.add_argument("--epochs", type=int, default=40)
     p.add_argument("--learning_rate", type=float, default=1e-3)
     p.add_argument("--weight_decay", type=float, default=1e-5)
     p.add_argument("--lr_step_size", type=int, default=20)
     p.add_argument("--lr_gamma", type=float, default=0.2)
-    p.add_argument("--val_freq", type=int, default=5, help="Validate every N epochs")
+    p.add_argument("--val_freq", type=int, default=1, help="Validate every N epochs")
 
     # System / misc
     p.add_argument("--num_workers", type=int, default=0)
