@@ -117,7 +117,7 @@ from cycler import cycler
 if __name__ == "__main__":
     # Initialize paths
     external_data_path = Path.cwd() / "data"
-    scenario_data_path = "uniform_bias_spacing"
+    scenario_data_path = "uncertainty"
     datasets_path = external_data_path / "datasets" / scenario_data_path
     simulations_path = external_data_path / "simulations"
     saving_path = external_data_path / "weights"
@@ -137,7 +137,7 @@ if __name__ == "__main__":
         "SAVE_TO_FILE": False,  # Saving results to file or present them over CMD
         "CREATE_DATA": False,  # Creating new dataset
         "LOAD_DATA": True,  # Loading data from exist dataset
-        "LOAD_MODEL": False,  # Load specific model for training
+        "LOAD_MODEL": True,  # Load specific model for training
         "TRAIN_MODEL": False,  # Applying training operation
         "SAVE_MODEL": True,  # Saving tuned model
         "EVALUATE_MODE": False,  # Evaluating desired algorithms
@@ -147,7 +147,7 @@ if __name__ == "__main__":
 
         # Source - task based quantization
         "TRAIN_MODEL_SOURCES": False,  # Applying training operation for the sources
-        "EVALUATE_MODE_SOURCES": True,  # Evaluating desired algorithms
+        "EVALUATE_MODE_SOURCES": False,  # Evaluating desired algorithms
         "CREATE_CODEBOOK_SOURCES": False,  # Create the codebook for VQ-VAE
         "TRAIN_QUANTIZED_SOURCES": False,  # Train the model for the quantization
 
@@ -162,6 +162,8 @@ if __name__ == "__main__":
         "TRAIN_QUANTIZED_SOURCES_TASK_IGNORANT": False,  # Train the model for the quantization
 
         "TRAIN_SCALAR_QUANTIZATION_SOURCES" : False, # Train the model for Scalar quantization
+
+        "EVALUATE_UNCERTAINTY_MODEL" : True
     }
 
     ## Graph tools
@@ -191,11 +193,11 @@ if __name__ == "__main__":
     system_model_params = (
         SystemModelParams()
         .set_parameter("N", 8)
-        .set_parameter("M", 3)
+        .set_parameter("M", 2)
         .set_parameter("T", 100)
         .set_parameter("snr", 10)
         .set_parameter("signal_type", "NarrowBand")
-        .set_parameter("signal_nature", "non-coherent")
+        .set_parameter("signal_nature", "coherent")
         .set_parameter("eta", 0)
         .set_parameter("bias", 0.0)
         .set_parameter("sv_noise_var", 0)
@@ -218,6 +220,7 @@ if __name__ == "__main__":
     # Define samples size
     samples_size = 100000  # Overall dateset size
     train_test_ratio = 0.05  # training and testing datasets ratio
+    model_config.tau = 8
     # Sets simulation filename
     simulation_filename = get_simulation_filename(
         system_model_params=system_model_params, model_config=model_config
@@ -271,10 +274,12 @@ if __name__ == "__main__":
             )
     # Datasets loading
     elif commands["LOAD_DATA"]:
-        if model_config.model_type == "SignalsSubspaceNet" or model_config.model_type == "TaskIgnorantSubspaceNet":
-            model_type_name = "SubspaceNet"
-        else:
-            model_type_name = model_config.model_type
+        #if model_config.model_type == "SignalsSubspaceNet" or model_config.model_type == "TaskIgnorantSubspaceNet":
+        #    model_type_name = "SubspaceNet"
+        #else:
+        #    model_type_name = model_config.model_type
+        model_type_name = model_config.model_type
+
         (
             train_dataset,
             test_dataset,
@@ -1641,6 +1646,30 @@ if __name__ == "__main__":
         generic_test_dataset = torch.utils.data.DataLoader(
             generic_test_dataset, batch_size=1, shuffle=False, drop_last=False
         )
+
+        simulation_parameters = (
+            TrainingParams()
+            .set_model(model=model_config)
+            .load_model(
+                loading_path=saving_path
+                             / "final_models"
+                             / simulation_filename
+            )
+        )
+        model = simulation_parameters.model
+        test_length = 0
+        with torch.no_grad():
+            for data in generic_test_dataset:
+                X, DOA = data
+                test_length += DOA.shape[0]
+                # Convert observations and DoA to device
+                X = X.to(device)
+                DOA = DOA.to(device)
+                # Get model output
+                predicates_doa, R, _ = model_output = model(X)
+
+
+
 
     plt.show()
     print("end")

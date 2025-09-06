@@ -106,7 +106,7 @@ class MultiSubarraysModel(nn.Module):
 
         z_i_stack = torch.stack(z_i, dim=1)
         for subarray_index in range(self.number_of_sensors):
-            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(z_i_stack[:,subarray_index,:,:])
+            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
             bearings.append(doa_pred)
 
         bearings = torch.stack(bearings, dim=1)

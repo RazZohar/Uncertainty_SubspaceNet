@@ -24,11 +24,13 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only):
         sensor_positions = sensor_positions.to(device)
         source_positions = source_positions.to(device)
         samples = samples.to(device)
-        doa_gt = doa_gt.to(device)
+        doa_gt = torch.deg2rad(doa_gt).to(device)
 
         if doa_only:
-            pred = model(sensor_positions, samples, doa_gt)
-            loss = criterion(pred, doa_gt)
+            doa_pred, pos_pred, dop = model(sensor_positions, samples, doa_gt)
+            doa_pred = doa_pred.squeeze(dim=-1)
+            loss = criterion(doa_pred, doa_gt)
+
         else:
             pred = model(sensor_positions, samples, None)
             loss = criterion(pred, source_positions)
@@ -44,7 +46,7 @@ def main():
     parser.add_argument("--config_path", required=True, help="Path to YAML config file")
     parser.add_argument("--checkpoint_path", required=True, help="Path to model checkpoint")
     parser.add_argument("--train_doa_only", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=100)
+    parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_to_wandb", action="store_true")
     args = parser.parse_args()

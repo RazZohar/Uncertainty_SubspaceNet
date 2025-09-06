@@ -239,6 +239,54 @@ def MSPE(doa_predictions: np.ndarray, doa: np.ndarray):
     # Choose minimal error from all permutations
     return np.min(rmspe_list)
 
+
+def MSPE_Empricial(doa_predictions: np.ndarray, doa: np.ndarray):
+    """
+    This function calculate the Empricial MSPE between the DOA predictions and target DOA values.
+    :param doa_predictions:
+    :param doa:
+    :return: Empricial MSPE value in degrees.
+    """
+    rmspe_list = []
+    for p in list(permutations(doa_predictions, len(doa_predictions))):
+        p = np.array(p)
+        doa = np.array(doa)
+        # Calculate error with modulo pi
+        error = (((p - doa) * np.pi / 180) + np.pi / 2) % np.pi - np.pi / 2
+        # Calculate MSE over all permutations
+        rmspe_val = (np.linalg.norm(np.rad2deg(error)) ** 2)
+        rmspe_list.append(rmspe_val)
+    # Choose minimal error from all permutations
+    return np.min(rmspe_list)
+
+def BPE(doa_predictions: np.ndarray, doa: np.ndarray):
+    """Calculate the Mean Square Percentage Error (RMSPE) between the DOA predictions and target DOA values.
+
+    Args:
+        doa_predictions (np.ndarray): Array of DOA predictions.
+        doa (np.ndarray): Array of target DOA values.
+
+    Returns:
+        float: The computed RMSPE value.
+
+    Raises:
+        None
+    """
+    bias_list = []
+    for p in list(permutations(doa_predictions, len(doa_predictions))):
+        p = np.array(p)
+        doa = np.array(doa)
+        # Calculate error with modulo pi
+        bias = (((p - doa) * np.pi / 180) + np.pi / 2) % np.pi - np.pi / 2
+        # Calculate MSE over all permutations
+        bias_p =  bias
+
+        bias_list.append(np.abs(np.rad2deg(bias_p)))
+    # Choose minimal error from all permutations
+    return np.min(bias_list)
+
+
+
 def set_criterions(criterion_name:str):
     """
     Set the loss criteria based on the criterion name.
