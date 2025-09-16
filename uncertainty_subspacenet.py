@@ -402,7 +402,7 @@ def align_one_trial(doa_hat_deg: np.ndarray, doa_true_deg: np.ndarray, period: f
 # ----------------- Summaries across trials (per-mode) -----------------
 def bias_mse_var_with_perm(doa_hat_deg_trials: np.ndarray,
                            doa_true_deg: np.ndarray,
-                           period: float = 180.0):
+                           period: float = 180.0, sigma_hat_deg2_trials=None):
     """
     Compute per-mode signed bias (deg), MSE (deg²), and unbiased variance (deg²)
     using permutation alignment per trial and π-periodic wrapping.
@@ -420,34 +420,64 @@ def bias_mse_var_with_perm(doa_hat_deg_trials: np.ndarray,
         'var_unbiased_deg2' : (K,) per-mode unbiased variance in deg²
         'perm_history'      : (T, K) ints, chosen est index per truth mode (optional debugging)
     """
+    """
+     Aligns DOA estimates to truth per trial, wraps errors, and (optionally)
+     permutes predicted per-DOA variances with the SAME permutation.
+
+     Returns per-DOA bias, MSE, unbiased variance, permutation history, and
+     (if provided) aligned σ̂² plus aggregated predicted std devs.
+     """
     doa_hat_deg_trials = np.asarray(doa_hat_deg_trials, float)
     doa_true_deg = np.asarray(doa_true_deg, float)
     T, K = doa_hat_deg_trials.shape
 
-    # Collect aligned, wrapped errors per trial in truth order
-    errs = np.zeros((T, K), dtype=float)
+    errs = np.zeros((T, K), dtype=float)  # wrapped, signed, in truth order
     perm_hist = np.zeros((T, K), dtype=int)
 
+    aligned_sigma_hat_deg2 = None
+    if sigma_hat_deg2_trials is not None:
+        sigma_hat_deg2_trials = np.asarray(sigma_hat_deg2_trials, float)
+        assert sigma_hat_deg2_trials.shape == (T, K)
+        aligned_sigma_hat_deg2 = np.zeros((T, K), dtype=float)
+
     for t in range(T):
+        # perm_t permutes θ̂ indices → truth order
         perm_t, err_t, _ = align_one_trial(doa_hat_deg_trials[t], doa_true_deg, period=period)
         perm_hist[t] = perm_t
-        errs[t] = err_t  # wrapped, signed, truth order
+        errs[t] = err_t
 
-    # Per-mode stats
-    bias_deg = errs.mean(axis=0)                     # signed bias (deg)
-    mse_deg2 = errs**2              # MSE (deg²)
-    # Unbiased sample variance around the (signed) mean:
-    # s^2 = (T/(T-1)) * (MSE - bias^2)
-    var_unbiased_deg2 =  (mse_deg2 - bias_deg**2)
-    # Clamp tiny negatives from rounding
+        # *** critical: carry the same permutation to σ̂² (θ̂-scale) ***
+        if aligned_sigma_hat_deg2 is not None:
+            aligned_sigma_hat_deg2[t] = sigma_hat_deg2_trials[t][perm_t]
+
+    # Per-DOA aggregates over trials
+    bias_deg = errs.mean(axis=0)  # E[e]
+    mse_deg2 = (errs ** 2).mean(axis=0)  # E[e^2]
+    if T > 1:
+        var_unbiased_deg2 = (T / (T - 1.0)) * (mse_deg2 - bias_deg ** 2)
+    else:
+        var_unbiased_deg2 = np.zeros(K, dtype=float)
     var_unbiased_deg2 = np.maximum(var_unbiased_deg2, 0.0)
 
-    return dict(
-        bias_deg=bias_deg,
-        mse_deg2=mse_deg2,
-        var_unbiased_deg2=var_unbiased_deg2,
-        perm_history=perm_hist
+    out = dict(
+        bias_deg=bias_deg,  # shape (K,)
+        mse_deg2=mse_deg2,  # shape (K,)
+        var_unbiased_deg2=var_unbiased_deg2,  # shape (K,)
+        perm_history=perm_hist,  # shape (T, K)
+        err_trials_deg=errs  # shape (T, K) (optional, handy)
     )
+
+    if aligned_sigma_hat_deg2 is not None:
+        # Predicted std per DOA = sqrt( E[σ̂²] )  (truth order)
+        pred_std_hat_deg_per_doa = np.sqrt(aligned_sigma_hat_deg2.mean(axis=0))
+        out.update(
+            pred_var_hat_deg2_trials=aligned_sigma_hat_deg2,  # shape (T, K), truth order
+            pred_std_hat_deg_per_doa=pred_std_hat_deg_per_doa,  # shape (K,)
+            pred_std_hat_deg_mean=float(pred_std_hat_deg_per_doa.mean()),
+            pred_std_hat_deg_median=float(np.sqrt(np.median(aligned_sigma_hat_deg2, axis=0)).mean())
+        )
+
+    return out
 
 # ===================== Monte‑Carlo driver (wrapped, no permutation) =====================
 
@@ -595,6 +625,119 @@ def monte_carlo_compare_eq58_wrapped_no_perm(
 
     }
     return summary
+
+
+from math import erf, sqrt, pi
+
+# ---- small helpers (no SciPy) ----
+def _safe_spearman_no_scipy(x, y):
+    x = np.asarray(x, float); y = np.asarray(y, float)
+    m = np.isfinite(x) & np.isfinite(y)
+    x = x[m]; y = y[m]
+    if x.size < 2:
+        return np.nan
+    def rankdata(a):
+        order = np.argsort(a, kind="mergesort")
+        ranks = np.empty_like(order, dtype=float)
+        ranks[order] = np.arange(len(a), dtype=float)
+        vals = a[order]; i = 0
+        while i < len(a):
+            j = i
+            while j + 1 < len(a) and vals[j+1] == vals[i]:
+                j += 1
+            avg = (i + j) / 2.0
+            ranks[i:j+1] = avg
+            i = j + 1
+        return ranks + 1.0
+    rx = rankdata(x); ry = rankdata(y)
+    rx = (rx - rx.mean()) / rx.std(ddof=0)
+    ry = (ry - ry.mean()) / ry.std(ddof=0)
+    return float(np.mean(rx * ry))
+
+def _eval_uncertainty_flat(e_deg, sigma_hat_deg, z_levels=(1.0, 2.0),
+                           rel_grid=np.linspace(0.1, 3.0, 60), eps=1e-12):
+    e = np.asarray(e_deg, float).ravel()
+    sh = np.maximum(np.asarray(sigma_hat_deg, float).ravel(), eps)
+    m = np.isfinite(e) & np.isfinite(sh)
+    e = e[m]; sh = sh[m]
+    u = e / sh
+    abs_e = np.abs(e)
+
+    # coverage & reliability
+    coverage = {z: float(np.mean(np.abs(u) <= z)) for z in z_levels}
+    nominal  = {z: float(erf(z / sqrt(2.0)) * 2 - 1) for z in z_levels}
+    emp_cov_curve = [float(np.mean(np.abs(u) <= z)) for z in rel_grid]
+    nom_cov_curve = [float(erf(z / sqrt(2.0)) * 2 - 1) for z in rel_grid]
+
+    # NLL, bias/var/MSE, RMSE
+    nll = 0.5*np.log(2*pi*(sh**2)) + 0.5*(e**2)/(sh**2)
+    bias = float(np.mean(e))
+    var  = float(np.mean((e - bias)**2))
+    mse  = float(np.mean(e**2))
+    rmse = float(np.sqrt(mse))
+    nll_mean = float(np.mean(nll)); nll_std = float(np.std(nll))
+
+    rho = _safe_spearman_no_scipy(abs_e, sh)
+
+    # ---- figure (3 panels) ----
+    fig = plt.figure(figsize=(12, 3.6))
+
+    # (1) coverage bars
+    ax1 = fig.add_subplot(1, 3, 1)
+    zs = list(z_levels); emp = [coverage[z] for z in zs]; nom = [nominal[z] for z in zs]
+    idx = np.arange(len(zs)); width = 0.35
+    ax1.bar(idx - width/2, nom, width, label='Nominal')
+    ax1.bar(idx + width/2, emp, width, label='Empirical')
+    ax1.set_xticks(idx); ax1.set_xticklabels([f"z={z:g}" for z in zs])
+    ax1.set_ylim(0, 1); ax1.set_ylabel("Coverage"); ax1.set_title("Coverage @ z∈{1,2}")
+    ax1.legend()
+
+    # (2) reliability curve
+    ax2 = fig.add_subplot(1, 3, 2)
+    ax2.plot(rel_grid, nom_cov_curve, label="Nominal (2Φ(z)−1)")
+    ax2.plot(rel_grid, emp_cov_curve, label="Empirical")
+    ax2.set_xlabel("z"); ax2.set_ylabel("Coverage(|e| ≤ z·σ̂)")
+    ax2.set_ylim(0, 1); ax2.set_title("Reliability (coverage vs z)")
+    ax2.legend()
+
+    # (3) |e| vs σ̂ scatter (+ expectation line)
+    ax3 = fig.add_subplot(1, 3, 3)
+    ax3.scatter(sh, abs_e, s=8, alpha=0.5)
+    xs = np.linspace(0, np.percentile(sh, 99.5), 120)
+    ax3.plot(xs, xs*sqrt(2.0/pi), linestyle='--', linewidth=1.0)
+    ax3.set_xlabel("σ̂ (deg)"); ax3.set_ylabel("|e| (deg)")
+    #ax3.set_title(f"|e| vs σ̂  (Spearman={rho:.3f}, NLL={nll_mean:.3f}±{nll_std:.3f})")
+    fig.tight_layout()
+
+    return {
+        "coverage": coverage,
+        "nll_mean": nll_mean,
+        "nll_std": nll_std,
+        "bias_deg": bias,
+        "var_deg2": var,
+        "mse_deg2": mse,
+        "rmse_deg": rmse,
+        "spearman_abs_e_sigma": rho,
+    }, fig
+
+def _aggregate_over_trials(theta_hat_list, var_deg2_list, truth_list, period=180.0):
+    """
+    Aligns each trial to truth, wraps errors, aggregates all samples, and evaluates.
+    Inputs are lists of 1D arrays (per-trial, per-mode).
+    """
+    e_all = []
+    sh_all = []
+    for th, vdeg2, truth in zip(theta_hat_list, var_deg2_list, truth_list):
+        th = np.asarray(th, float).ravel()
+        vdeg2 = np.asarray(vdeg2, float).ravel()
+        truth = np.asarray(truth, float).ravel()
+        # align this trial
+        perm, err_wrapped_deg, _ = align_one_trial(th, truth, period=period)
+        e_all.append(err_wrapped_deg)
+        sh_all.append(np.sqrt(vdeg2[perm]))
+    e_all = np.concatenate(e_all, axis=0)
+    sh_all = np.concatenate(sh_all, axis=0)
+    return _eval_uncertainty_flat(e_all, sh_all)
 
 
 def model_based_uncertainty(
@@ -899,7 +1042,7 @@ def run_simulation_by_system_params(system_model_params):
     print("------------------------------------")
     print("date and time =", dt_string)
     # Initialize seed
-    set_unified_seed()
+    set_unified_seed(1337)
     # Datasets creation
     if commands["CREATE_DATA"]:
         # Define which datasets to generate
@@ -1111,6 +1254,9 @@ def run_simulation_by_system_params(system_model_params):
         result_uncertainty_all = []
         results_uncertainty_mb_all = []
         esprit_model_based = Esprit(SystemModel(system_model_params=system_model_params))
+        mbdl_theta_hat_list, mbdl_var_deg2_list, mbdl_truth_list = [], [], []
+        mb_theta_hat_list, mb_var_deg2_list, mb_truth_list = [], [], []
+
         with torch.no_grad():
             for data in generic_test_dataset:
                 X, DOA = data
@@ -1126,9 +1272,21 @@ def run_simulation_by_system_params(system_model_params):
                                                                   X.shape[-1], np.rad2deg(DOA)[0])
                 result_uncertainty_all.append(results_uncertainty)
 
+                var_hat_deg2 = np.atleast_1d(results_uncertainty["predicted_var_deg2_scale_theta_hat"])
+                mbdl_theta_hat_list.append(np.rad2deg(predicates_doa)[0] )
+                mbdl_var_deg2_list.append(var_hat_deg2)
+                mbdl_truth_list.append(np.rad2deg(DOA)[0])
+
                 doa_predicated_model_based, _ = esprit_model_based.narrowband(X.squeeze(dim=0), system_model_params.M)
                 results_uncertainty_model_based = model_based_uncertainty(np.rad2deg(DOA)[0], X.squeeze(dim=0), np.rad2deg(doa_predicated_model_based))
                 results_uncertainty_mb_all.append(results_uncertainty_model_based)
+
+                var_mb_deg2 = np.atleast_1d(results_uncertainty_model_based["predicted_var_deg2_scale_theta_hat"])
+                mb_theta_hat_list.append(np.rad2deg(doa_predicated_model_based))
+                mb_var_deg2_list.append(var_mb_deg2)
+                mb_truth_list.append(np.rad2deg(DOA)[0])
+
+
 
         result_uncertainty_avg = {
             k: np.mean([d[k] for d in result_uncertainty_all], axis=0)
@@ -1153,12 +1311,81 @@ def run_simulation_by_system_params(system_model_params):
         uncertainty_result_file_name = simulation_filename + '_uncertainty.npy'
         np.save(saving_path / uncertainty_result_file_name, {"MBDL" : result_uncertainty_avg, "MB":result_uncertainty_mb_avg})
 
+        # compute empirical var from MSE & bias; keep both spellings to avoid breaking downstream code
+        result_uncertainty_avg["empirical_var1"] = result_uncertainty_avg["mspe1"] - result_uncertainty_avg[
+            "bias1"] ** 2
+        result_uncertainty_avg["emprical_var1"] = result_uncertainty_avg["empirical_var1"]
+        result_uncertainty_mb_avg["empirical_var1"] = result_uncertainty_mb_avg["mspe1"] - result_uncertainty_mb_avg[
+            "bias1"] ** 2
+        result_uncertainty_mb_avg["emprical_var1"] = result_uncertainty_mb_avg["empirical_var1"]
+
+        print(result_uncertainty_avg)
+        print(result_uncertainty_mb_avg)
+        print(
+            f"Std Dev - Empirical {np.sqrt(result_uncertainty_avg['empirical_var1'])} "
+            f"vs Predicted {np.sqrt(result_uncertainty_avg['predicted_var_deg2_scale_theta_hat'])}"
+        )
+        print(
+            f"Model Based Std Dev - Empirical {np.sqrt(result_uncertainty_mb_avg['empirical_var1'])} "
+            f"vs Predicted {np.sqrt(result_uncertainty_mb_avg['predicted_var_deg2_scale_theta_hat'])}"
+        )
+
+        # ---------- NEW: Aggregate calibration over all ~5k trials ----------
+        """period = 180.0  # π-periodic for a ULA; change to 360.0 if appropriate
+        mbdl_metrics, mbdl_fig = _aggregate_over_trials(mbdl_theta_hat_list, mbdl_var_deg2_list, mbdl_truth_list,
+                                                        period)
+        mb_metrics, mb_fig = _aggregate_over_trials(mb_theta_hat_list, mb_var_deg2_list, mb_truth_list, period)
+
+        print("=== MBDL (plug-in with \\tilde{R}_x) ===")
+        print(mbdl_metrics)
+        print("=== MB (plug-in; oracle R_x if your fn uses population) ===")
+        print(mb_metrics)
+
+        # Quick scalar comparison
+        avg_std_emp_mbdl = np.sqrt(mbdl_metrics["var_deg2"])
+        avg_std_pred_mbdl = float(np.mean(np.sqrt(np.concatenate(mbdl_var_deg2_list))))
+        avg_std_emp_mb = np.sqrt(mb_metrics["var_deg2"])
+        avg_std_pred_mb = float(np.mean(np.sqrt(np.concatenate(mb_var_deg2_list))))
+        
+        print(f"MBDL: StdDev Empirical={avg_std_emp_mbdl}° vs Predicted={avg_std_pred_mbdl}°")
+        print(f"MB:   StdDev Empirical={avg_std_emp_mb}°   vs Predicted={avg_std_pred_mb}°")
+
+        # ---------- Save figures + results ----------
+        calib_mbdl_png = saving_path / f"{simulation_filename}_calibration_MBDL.png"
+        calib_mb_png = saving_path / f"{simulation_filename}_calibration_MB.png"
+        #mbdl_fig.suptitle("MBDL Calibration", y=1.02)
+        #mb_fig.suptitle("MB Calibration", y=1.02)
+        mbdl_fig.savefig(calib_mbdl_png, dpi=200, bbox_inches="tight")
+        mb_fig.savefig(calib_mb_png, dpi=200, bbox_inches="tight")
+        #plt.close(mbdl_fig);
+        #plt.close(mb_fig)
+
+        uncertainty_result_file_name = simulation_filename + "_uncertainty.npy"
+        np.save(
+            saving_path / uncertainty_result_file_name,
+            {
+                "MBDL": result_uncertainty_avg,
+                "MB": result_uncertainty_mb_avg,
+                # add aggregate calibration metrics
+                "MBDL_metrics": mbdl_metrics,
+                "MB_metrics": mb_metrics,
+                "MBDL_avg_std_empirical_deg": float(avg_std_emp_mbdl),
+                "MBDL_avg_std_predicted_deg": float(avg_std_pred_mbdl),
+                "MB_avg_std_empirical_deg": float(avg_std_emp_mb),
+                "MB_avg_std_predicted_deg": float(avg_std_pred_mb),
+                "calibration_figs": {
+                    "MBDL_png": str(calib_mbdl_png),
+                    "MB_png": str(calib_mb_png),
+                },
+            },
+        )
+        """
     plt.show()
     print("end")
 
     return {"MBDL" : result_uncertainty_avg, "MB":result_uncertainty_mb_avg}
 
-def sweep_simulation_by_snr(snr, M=2, coherent_case=False):
+def sweep_simulation_by_snr(snr, T=100,M=2, coherent_case=False):
     #global model_config
     if coherent_case is True:
         signal_nature = "coherent"
@@ -1169,7 +1396,7 @@ def sweep_simulation_by_snr(snr, M=2, coherent_case=False):
         SystemModelParams()
         .set_parameter("N", 8)
         .set_parameter("M", M)
-        .set_parameter("T", 500)
+        .set_parameter("T", T)
         .set_parameter("snr", snr)
         .set_parameter("signal_type", "NarrowBand")
         .set_parameter("signal_nature", signal_nature)
@@ -1233,10 +1460,10 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     # --- plot in your preferred style ---
     fig, ax = plt.subplots(figsize=(8, 6))
 
-    ax.plot(snrs, mbdl_pred, linestyle='--', marker='o', label="MBDL Predicted")
-    ax.plot(snrs, mbdl_emp, linestyle='--', marker='*', label="MBDL Empirical")
-    ax.plot(snrs, mb_pred, linestyle='--', marker='o', label="MB Predicted")
-    ax.plot(snrs, mb_emp, linestyle='--', marker='*', label="MB Empirical")
+    ax.plot(snrs, mbdl_pred, linestyle='--', marker='^', label="MBDL Predicted")
+    ax.plot(snrs, mbdl_emp, linestyle='-.', marker='^', label="MBDL Empirical")
+    ax.plot(snrs, mb_pred, linestyle='--', marker='*', label="MB Predicted")
+    ax.plot(snrs, mb_emp, linestyle='-.', marker='*', label="MB Empirical")
 
     # Title + legend
     #ax.set_title("Predicted vs Empirical DOA stddev vs " + argument, pad=30)
@@ -1244,8 +1471,10 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     handles, labels = ax.get_legend_handles_labels()
     by_label = dict(zip(labels, handles))
     ax.legend(by_label.values(), by_label.keys(),
-              loc='best', bbox_to_anchor=(0.5, 0., 0.5, 0.5),
+              loc='best', bbox_to_anchor=(0.25, 0., 0.25, 0.25),
               ncol=2, frameon=False)
+    #ax.legend(by_label.values(), by_label.keys(),
+    #          loc='lower left', ncol=2, frameon=False)
 
     ax.set_xlabel(argument)
     ax.set_ylabel("Std-dev (deg)")
@@ -1257,16 +1486,16 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     mask = (snrs_arr >= 0) & (snrs_arr <= 20)
 
     axins = inset_axes(ax, width="35%", height="35%", loc="upper right", borderpad=1.0)
-    axins.plot(snrs, mbdl_pred, linestyle='--', marker='o')
-    axins.plot(snrs, mbdl_emp, linestyle='--', marker='*')
-    axins.plot(snrs, mb_pred, linestyle='--', marker='o')
-    axins.plot(snrs, mb_emp, linestyle='--', marker='*')
+    axins.plot(snrs, mbdl_pred, linestyle='--', marker='^')
+    axins.plot(snrs, mbdl_emp, linestyle='-.', marker='^')
+    axins.plot(snrs, mb_pred, linestyle='--', marker='*')
+    axins.plot(snrs, mb_emp, linestyle='-.', marker='*')
 
     axins.set_xlim(0, 20)
     ys_inset = np.concatenate([mbdl_pred[mask], mbdl_emp[mask], mb_pred[mask], mb_emp[mask]])
     pad = 0.05 * (ys_inset.max() - ys_inset.min() + 1e-12)
     axins.set_ylim(0, 3 + pad)
-    #axins.set_ylim(ys_inset.min() - pad, ys_inset.max() + pad)
+    axins.set_ylim(ys_inset.min() - pad, ys_inset.max() + pad)
 
     axins.tick_params(labelsize=6)
     ax.indicate_inset_zoom(axins, edgecolor="0.5")
@@ -1304,10 +1533,10 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     """
 
 
-def sweep_uncertainty_snrs(snrs=[-10.0, -3.0, 0.0, 3.0, 10.0, 20.0], M=2, coherent_case=False):
+def sweep_uncertainty_snrs(snrs=[-10.0, -3.0, 0.0, 3.0, 10.0, 20.0], T=100, M=2, coherent_case=False):
     results = {}
     for snr in snrs:
-        summary = sweep_simulation_by_snr(snr, M=M, coherent_case=coherent_case)
+        summary = sweep_simulation_by_snr(snr, T=T, M=M, coherent_case=coherent_case)
         results[snr] = summary
 
         print(f"\nSNR = {snr:>5.1f} dB")
@@ -1354,9 +1583,9 @@ if __name__ == "__main__":
     # Operations commands
     commands = {
         "SAVE_TO_FILE": False,  # Saving results to file or present them over CMD
-        "CREATE_DATA": True,  # Creating new dataset
+        "CREATE_DATA": False,  # Creating new dataset
         "LOAD_DATA": True,  # Loading data from exist dataset
-        "LOAD_MODEL": False,  # Load specific model for training
+        "LOAD_MODEL": True,  # Load specific model for training
         "TRAIN_MODEL": False,  # Applying training operation
         "SAVE_MODEL": True,  # Saving tuned model
         "EVALUATE_MODE": False,  # Evaluating desired algorithms
@@ -1365,13 +1594,8 @@ if __name__ == "__main__":
         "TRAIN_SCALAR_QUANTIZATION": False,  # Train the model for Scalar quantization
 
         # Source - task based quantization
-        "TRAIN_MODEL_SOURCES": True,  # Applying training operation for the sources
+        "TRAIN_MODEL_SOURCES": False,  # Applying training operation for the sources
         "EVALUATE_MODE_SOURCES": False,  # Evaluating desired algorithms
-        "CREATE_CODEBOOK_SOURCES": False,  # Create the codebook for VQ-VAE
-        "TRAIN_QUANTIZED_SOURCES": False,  # Train the model for the quantization
-
-        "TRAIN_SCALAR_QUANTIZATION_SOURCES": False,  # Train the model for Scalar quantization
-
         "EVALUATE_UNCERTAINTY_MODEL": True
     }
 
@@ -1390,6 +1614,7 @@ if __name__ == "__main__":
     # Now same length, can combine
     plt.rcParams['axes.prop_cycle'] = cycler(color=colors) + cycler(linestyle=dash_cycle)
     CODEBOOK_SIZE = 128
+    plt.rcParams.update({'font.size': 14})
 
     print(f'Start Executing commands')
     # Saving simulation scores to external file
@@ -1400,20 +1625,21 @@ if __name__ == "__main__":
         sys.stdout = open(file_path, "w")
 
     #[-3.0, 0.0, 3.0, 10.0, 20.0]
-    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=2, coherent_case=False)
-    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=2, coherent_case=True)
-    sweep_simulation_by_eta([0.0, 0.01, 0.02, 0.03, 0.04, 0.05])
+    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=2, coherent_case=False)
+    #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=2, coherent_case=True)
+    #sweep_simulation_by_eta([0.0, 0.01, 0.02, 0.03, 0.04, 0.05])
 
-    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=3, coherent_case=False)
-    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=3, coherent_case=True)
+
+    #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=3, coherent_case=False)
+    #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=3, coherent_case=True)
 
     #sweep_simulation_by_eta([0.2, 0.15, 0.1, 0.05, 0.01])
 
     # ============================== Demo run ==============================
 
-def model_based_uncertainty():
+def model_based_uncertainty_old():
     cohernet_signals = False
-    np.random.seed(123)
+    #np.random.seed(123)
     doas = [20.0, 40.0]      # two sources; mode 0 ↔ 10°, mode 1 ↔ 25°
 
     # Example: sweep SNRs and print summary lines

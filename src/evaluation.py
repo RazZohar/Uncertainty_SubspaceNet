@@ -729,12 +729,12 @@ def evaluate(
             # "mvdr",
             #"r-music",
             #"esprit",
-            "music",
+            #"music",
         ]
     # Set default model-based subspace methods
     if not isinstance(subspace_methods, list):
         subspace_methods = [
-            #"esprit",
+            "esprit",
             #"music",
             #"r-music",
             #"mvdr",
