@@ -1,0 +1,33 @@
+{
+  "L": 2,
+  "subarray_config": [
+    {
+      "system_model": {
+        "N": 8,
+        "M": 1,
+        "T": 100,
+        "snr": 10,
+        "signal_type": "NarrowBand",
+        "signal_nature": "non-coherent",
+        "eta": 0.0,
+        "bias": 0.0,
+        "sv_noise_var": 0.0,
+        "codebook_size": 128
+      }
+    },
+    {
+      "system_model": {
+        "N": 8,
+        "M": 1,
+        "T": 100,
+        "snr": 10,
+        "signal_type": "NarrowBand",
+        "signal_nature": "non-coherent",
+        "eta": 0.0,
+        "bias": 0.0,
+        "sv_noise_var": 0.0,
+        "codebook_size": 128
+      }
+    }
+  ]
+}

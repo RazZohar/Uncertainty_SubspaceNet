@@ -1,0 +1,14 @@
+{
+    "system_model": {
+        "N": 8,
+        "M": 5,
+        "T": 100,
+        "snr": 10,
+        "signal_type": "NarrowBand",
+        "signal_nature": "coherent",
+        "eta": 0.05,
+        "bias": 0.05,
+        "sv_noise_var": 0.2,
+        "codebook_size": 4
+    }
+}
