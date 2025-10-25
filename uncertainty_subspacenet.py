@@ -1013,7 +1013,7 @@ from itertools import cycle
 from matplotlib import rcParams
 from cycler import cycler
 
-def run_simulation_by_system_params(system_model_params):
+def run_simulation_by_system_params(system_model_params, seed=None):
     # Generate model configuration
     MAXIMAL_TAU = 8
     model_config = (
@@ -1041,12 +1041,11 @@ def run_simulation_by_system_params(system_model_params):
     print("---------- New Simulation ----------")
     print("------------------------------------")
     print("date and time =", dt_string)
-    # Initialize seed
-    set_unified_seed(1337)
+
     # Datasets creation
     if commands["CREATE_DATA"]:
         # Define which datasets to generate
-        create_training_data = True  # Flag for creating training data
+        create_training_data = False  # Flag for creating training data
         create_testing_data = True  # Flag for creating test data
         print("Creating Data...")
         if create_training_data:
@@ -1458,7 +1457,7 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     _, mb_pred, mb_emp = collect_method_means(dict_data, "MB")
 
     # --- plot in your preferred style ---
-    fig, ax = plt.subplots(figsize=(8, 6))
+    fig, ax = plt.subplots(figsize=(8, 6), layout='constrained')
 
     ax.plot(snrs, mbdl_pred, linestyle='--', marker='^', label="MBDL Predicted")
     ax.plot(snrs, mbdl_emp, linestyle='-.', marker='^', label="MBDL Empirical")
@@ -1468,11 +1467,21 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     # Title + legend
     #ax.set_title("Predicted vs Empirical DOA stddev vs " + argument, pad=30)
 
+    # Legend at top of the FIGURE (not inside the axes)
     handles, labels = ax.get_legend_handles_labels()
-    by_label = dict(zip(labels, handles))
-    ax.legend(by_label.values(), by_label.keys(),
-              loc='best', bbox_to_anchor=(0.25, 0., 0.25, 0.25),
-              ncol=2, frameon=False)
+    by_label = dict(zip(labels, handles))  # de-dup
+
+    # leave some room at top for the legend
+    #fig.tight_layout(rect=[0, 0, 1, 0.92])
+
+    fig.legend(
+        by_label.values(), by_label.keys(),
+        loc="outside upper center",
+        ncol=2,
+
+    )
+
+    fig.subplots_adjust(top=0.82)
     #ax.legend(by_label.values(), by_label.keys(),
     #          loc='lower left', ncol=2, frameon=False)
 
@@ -1482,23 +1491,24 @@ def create_figures_from_data(dict_data, title, argument="SNR (dB)"):
     plt.tight_layout()
 
     # --- inset zoom over SNR [0,20] ---
-    snrs_arr = np.asarray(snrs)
-    mask = (snrs_arr >= 0) & (snrs_arr <= 20)
+    if 'Eta' not in argument:
+        snrs_arr = np.asarray(snrs)
+        mask = (snrs_arr >= 10) & (snrs_arr <= 20)
 
-    axins = inset_axes(ax, width="35%", height="35%", loc="upper right", borderpad=1.0)
-    axins.plot(snrs, mbdl_pred, linestyle='--', marker='^')
-    axins.plot(snrs, mbdl_emp, linestyle='-.', marker='^')
-    axins.plot(snrs, mb_pred, linestyle='--', marker='*')
-    axins.plot(snrs, mb_emp, linestyle='-.', marker='*')
+        axins = inset_axes(ax, width="35%", height="35%", loc="upper right", borderpad=1.0)
+        axins.plot(snrs, mbdl_pred, linestyle='--', marker='^')
+        axins.plot(snrs, mbdl_emp, linestyle='-.', marker='^')
+        axins.plot(snrs, mb_pred, linestyle='--', marker='*')
+        axins.plot(snrs, mb_emp, linestyle='-.', marker='*')
 
-    axins.set_xlim(0, 20)
-    ys_inset = np.concatenate([mbdl_pred[mask], mbdl_emp[mask], mb_pred[mask], mb_emp[mask]])
-    pad = 0.05 * (ys_inset.max() - ys_inset.min() + 1e-12)
-    axins.set_ylim(0, 3 + pad)
-    axins.set_ylim(ys_inset.min() - pad, ys_inset.max() + pad)
+        axins.set_xlim(0, 20)
+        ys_inset = np.concatenate([mbdl_pred[mask], mbdl_emp[mask], mb_pred[mask], mb_emp[mask]])
+        pad = 0.05 * (ys_inset.max() - ys_inset.min() + 1e-12)
+        axins.set_ylim(0, 3 + pad)
+        axins.set_ylim(ys_inset.min() - pad, ys_inset.max() + pad)
 
-    axins.tick_params(labelsize=6)
-    ax.indicate_inset_zoom(axins, edgecolor="0.5")
+        axins.tick_params(labelsize=6)
+        ax.indicate_inset_zoom(axins, edgecolor="0.5")
 
     # Save
     plt.savefig("stddev_means.png", dpi=300, bbox_inches="tight")
@@ -1583,7 +1593,7 @@ if __name__ == "__main__":
     # Operations commands
     commands = {
         "SAVE_TO_FILE": False,  # Saving results to file or present them over CMD
-        "CREATE_DATA": False,  # Creating new dataset
+        "CREATE_DATA": True,  # Creating new dataset
         "LOAD_DATA": True,  # Loading data from exist dataset
         "LOAD_MODEL": True,  # Load specific model for training
         "TRAIN_MODEL": False,  # Applying training operation
@@ -1598,6 +1608,10 @@ if __name__ == "__main__":
         "EVALUATE_MODE_SOURCES": False,  # Evaluating desired algorithms
         "EVALUATE_UNCERTAINTY_MODEL": True
     }
+
+    # Initialize seed
+    #if seed is not None:
+    set_unified_seed(42)
 
     ## Graph tools
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
@@ -1625,10 +1639,10 @@ if __name__ == "__main__":
         sys.stdout = open(file_path, "w")
 
     #[-3.0, 0.0, 3.0, 10.0, 20.0]
-    sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=2, coherent_case=False)
-    #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], M=2, coherent_case=True)
-    #sweep_simulation_by_eta([0.0, 0.01, 0.02, 0.03, 0.04, 0.05])
-
+    sweep_uncertainty_snrs(snrs=[0.0, 3.0, 10.0, 20.0], T=500, M=2, coherent_case=False)
+    sweep_uncertainty_snrs(snrs=[0.0, 3.0, 10.0, 20.0], M=2, coherent_case=True)
+    sweep_simulation_by_eta([0.0, 0.01, 0.02, 0.03, 0.04, 0.05])
+    #sweep_uncertainty_snrs(snrs=[10.0], T=500, M=2, coherent_case=False)
 
     #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=3, coherent_case=False)
     #sweep_uncertainty_snrs(snrs=[-3.0, 0.0, 3.0, 10.0, 20.0], T=500, M=3, coherent_case=True)

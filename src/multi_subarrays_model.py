@@ -9,6 +9,7 @@ from .models import SignalsSubspaceNetEsprit
 from .multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 from .localization_block import RayIntersection
 from .learned_agg_layer import LearnedAgg
+from .uncertainty_block import UncertaintyEstimation
 
 def get_location_from_model_graph(model_graph, type_req='sensor'):
     """
@@ -30,6 +31,9 @@ class MultiSubarraysModel(nn.Module):
 
         self.subarray_models = nn.ModuleList()
         self.learned_attentaion = nn.ModuleList()
+
+        # Init the uncertainty predication block
+        self.uncertainty_pred = nn.ModuleList()
 
         self.create_model(subarrays_config)
 
@@ -55,6 +59,8 @@ class MultiSubarraysModel(nn.Module):
 
             # Add the learned attentaion layer
             self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
+
+            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(self.number_of_sensors))
 
 
     def _create_subarray_model_by_configuration(self, subarray_configuration):
@@ -105,8 +111,11 @@ class MultiSubarraysModel(nn.Module):
             z_i.insert(subarray_index, z)
 
         z_i_stack = torch.stack(z_i, dim=1)
+        sigma_i = []
         for subarray_index in range(self.number_of_sensors):
-            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(z_i_stack[:,subarray_index,:,:])
+            sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
+            sigma_i.append(sigma)
             bearings.append(doa_pred)
 
         bearings = torch.stack(bearings, dim=1)

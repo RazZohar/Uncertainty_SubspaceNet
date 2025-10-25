@@ -216,7 +216,7 @@ class SensorSourceGraphDataset(Dataset):
                                                                                        n_sources, sensor_positions=self._sensor_position)
 
             print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
-            # draw_graph_with_precomputed_angles(model_graph)
+            #draw_graph_with_precomputed_angles(model_graph)
 
             samples_graphs = []
             scene_model_dataset = []
