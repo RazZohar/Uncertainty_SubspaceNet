@@ -125,6 +125,74 @@ class RMSPELoss(nn.Module):
         result = torch.sum(torch.stack(rmspe, dim = 0))
         return result
 
+
+class MultiRMSPELoss(nn.Module):
+    """Root Mean Square Periodic Error (RMSPE) loss function.
+    This loss function calculates the RMSPE between the predicted values and the target values.
+    The predicted values and target values are expected to be in radians.
+
+    Args:
+        None
+
+    Attributes:
+        None
+
+    Methods:
+        forward(doa_predictions: torch.Tensor, doa: torch.Tensor) -> torch.Tensor:
+            Computes the RMSPE loss between the predictions and target values.
+
+    Example:
+        criterion = RMSPELoss()
+        predictions = torch.tensor([0.5, 1.2, 2.0])
+        targets = torch.tensor([0.8, 1.5, 1.9])
+        loss = criterion(predictions, targets)
+    """
+    def __init__(self):
+        super(MultiRMSPELoss, self).__init__()
+
+    def forward(self, doa_predictions: torch.Tensor, doa: torch.Tensor):
+        """Compute the RMSPE loss between the predictions and target values.
+        The forward method takes two input tensors: doa_predictions and doa.
+        The predicted values and target values are expected to be in radians.
+        The method iterates over the batch dimension and calculates the RMSPE loss for each sample in the batch.
+        It utilizes the permute_prediction function to generate all possible permutations of the predicted values
+        to consider all possible alignments. For each permutation, it calculates the error between the prediction
+        and target values, applies modulo pi to ensure the error is within the range [-pi/2, pi/2], and then calculates the RMSPE.
+        The minimum RMSPE value among all permutations is selected for each sample.
+        Finally, the method sums up the RMSPE values for all samples in the batch and returns the result as the computed loss.
+
+        Args:
+            doa_predictions (torch.Tensor): Predicted values tensor of shape (batch_size, num_predictions).
+            doa (torch.Tensor): Target values tensor of shape (batch_size, num_targets).
+
+        Returns:
+            torch.Tensor: The computed RMSPE loss.
+
+        Raises:
+            None
+        """
+        rmspe = []
+        batch_size = doa_predictions.shape[0]
+        subarray_count = doa_predictions.shape[1]
+        for iter in range(batch_size):
+            rmspe_list = []
+            batch_predictions = doa_predictions[iter].to(device)
+            targets = doa[iter].to(device)
+            prediction_perm = permute_prediction(batch_predictions).to(device)
+            for prediction in prediction_perm:
+                # Calculate error with modulo pi
+                error = (((prediction - targets) + (np.pi / 2)) % np.pi) - np.pi / 2
+                # Calculate RMSE over all permutations
+                rmspe_val = (1 / np.sqrt(len(targets))) * torch.linalg.norm(error)
+                rmspe_list.append(rmspe_val)
+            rmspe_tensor = torch.stack(rmspe_list, dim = 0)
+            # Choose minimal error from all permutations
+            rmspe_min = torch.min(rmspe_tensor)
+            rmspe.append(rmspe_min)
+        result = torch.sum(torch.stack(rmspe, dim = 0))
+        return result
+
+
 class MSPELoss(nn.Module):
     """Mean Square Periodic Error (MSPE) loss function.
     This loss function calculates the MSPE between the predicted values and the target values.

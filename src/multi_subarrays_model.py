@@ -102,20 +102,25 @@ class MultiSubarraysModel(nn.Module):
             vq_loss , q_quantized = self.subarray_models[subarray_index].sense_device_forward(iq_signals)
             q_i.append(q_quantized)
 
+        # TODO: Later add option to work in stages with arguments
         q_i_stack = torch.stack(q_i, dim=1)
-
-        # TODO: add attention between subarrays
-        z_i = []
-        for subarray_index in range(self.number_of_sensors):
-            z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
-            z_i.insert(subarray_index, z)
+        with torch.no_grad():
+            # TODO: add attention between subarrays
+            z_i = []
+            phi_i = []
+            for subarray_index in range(self.number_of_sensors):
+                z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
+                z_i.insert(subarray_index, z)
+                phi_i.insert(subarray_index, phi)
 
         z_i_stack = torch.stack(z_i, dim=1)
         sigma_i = []
         for subarray_index in range(self.number_of_sensors):
-            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(z_i_stack[:,subarray_index,:,:])
-            sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
-            sigma_i.append(sigma)
+            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+
+            with torch.no_grad():
+                sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
+                sigma_i.insert(subarray_index, sigma)
             bearings.append(doa_pred)
 
         bearings = torch.stack(bearings, dim=1)
@@ -123,15 +128,21 @@ class MultiSubarraysModel(nn.Module):
 
         #TODO: Assosicate angles
 
-        source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
+        #source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
 
         if self.args.train_doa_only:
-            return bearings, source_estimated_position, dop
+            requested_values = {}
+            requested_values["bearings"] = bearings
+            requested_values["source_estimated_position"] = (-5,-5)
+            requested_values["dop"] = None
+            requested_values["sigma_i"] = sigma_i
+            requested_values["phi_i"] = phi_i
+            return requested_values
 
         #TODO: Assosicate angles
 
         # Intersect rays
-        return bearings, source_estimated_position, dop
+        #return bearings, source_estimated_position, dop
         #return source_estimated_position
 
 

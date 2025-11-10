@@ -4,7 +4,7 @@
     {
       "system_model": {
         "N": 8,
-        "M": 1,
+        "M": 3,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",
@@ -18,7 +18,7 @@
     {
       "system_model": {
         "N": 8,
-        "M": 1,
+        "M": 3,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",

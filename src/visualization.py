@@ -9,7 +9,7 @@ import imageio.v2 as imageio  # safer for compatibility
 def visualize_ray_frame(positions, bearings, x_hat, x_true=None, step=None, save_path=None):
     positions = positions.detach().cpu().numpy()
     bearings  = bearings.detach().cpu().numpy()
-    x_hat     = x_hat.detach().cpu().numpy()
+#    x_hat     = x_hat.detach().cpu().numpy()
     if x_true is not None:
         x_true = x_true.detach().cpu().numpy()
 

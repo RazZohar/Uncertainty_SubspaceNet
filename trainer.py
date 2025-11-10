@@ -100,12 +100,16 @@ class Trainer:
         # ---------------- Model ----------------
         self.model = self._build_model().to(self.device)
 
+        # Configure which parts of the model are trainable
+        self._configure_trainable_params()
+
         # ---------------- Optimiser / Scheduler ----------------
         self.optimizer = optim.Adam(
-            self.model.parameters(),
+            self.trainable_params,
             lr=args.learning_rate,
             weight_decay=args.weight_decay,
         )
+
         self.scheduler = optim.lr_scheduler.StepLR(
             self.optimizer, step_size=args.lr_step_size, gamma=args.lr_gamma
         )
@@ -122,6 +126,41 @@ class Trainer:
     # ---------------------------------------------------------------------
     # Helpers
     # ---------------------------------------------------------------------
+
+    def _configure_trainable_params(self):
+        """
+        If args.train_scopes is None: train everything (original behavior).
+        Otherwise:
+          - freeze all parameters
+          - unfreeze only those whose name contains any of the scopes
+        """
+        if self.args.train_scopes is None:
+            # default: train everything
+            self.trainable_params = list(self.model.parameters())
+            return
+
+        # Freeze all params
+        for p in self.model.parameters():
+            p.requires_grad = False
+
+        scopes = self.args.train_scopes
+        for name, p in self.model.named_parameters():
+            if any(scope in name for scope in scopes):
+                p.requires_grad = True
+
+        self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+
+        if not self.trainable_params:
+            raise ValueError(
+                f"No parameters matched train_scopes={scopes}. "
+                f"Example: try --train_scopes subarray_models"
+            )
+
+        # Optional: print which parts are trainable
+        print("Trainable parameter groups:")
+        for name, p in self.model.named_parameters():
+            if p.requires_grad:
+                print("  ", name)
 
     def _extract_sensor_positions(self):
         sensor_positions = self.train_ds.dataset.get_sensor_potision()
@@ -141,8 +180,11 @@ class Trainer:
     def _load_checkpoint(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
         self.model.load_state_dict(ckpt["model_state_dict"])
-        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        try:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        except Exception as e:
+            print(f"[WARN] Could not load optimizer/scheduler state: {e}")
         return ckpt["epoch"]
 
     def _save_checkpoint(self, epoch: int, is_best: bool = False):
@@ -183,12 +225,19 @@ class Trainer:
                 if train:
                     self.optimizer.zero_grad()
 
+                # TODO: create accumlated loss
+                loss = 0
+
                 # gt_pos is now a tensor of dimension [M - Number of sources]. Each entry is the direction
                 # of source i from sensor array [subarray_index]
                 if self.args.train_doa_only:
-                    doa_pred, pos_pred, dop = self.model(sensor_positions, samples, doa_gt)
-                    doa_pred = doa_pred.squeeze(dim=-1)
-                    loss = self.criterion(doa_pred, doa_gt)
+                    model_result = self.model(sensor_positions, samples, doa_gt)
+                    doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
+                    #doa_pred, pos_pred, dop = self.model(sensor_positions, samples, doa_gt)
+                    #doa_pred = doa_pred.squeeze(dim=-1)
+                    #loss = self.criterion(doa_pred, doa_gt)
+                    for i in range(doa_gt.shape[1]):
+                        loss += self.criterion(doa_pred[:, i, :], doa_gt[:, i, :])
                 else:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
                     loss = self.criterion(pos_pred, source_positions.squeeze(-2))
@@ -275,10 +324,11 @@ class Trainer:
         doa_gt = doa_gt.to(self.device)
 
         with torch.no_grad():
-            doa_pred, pos_pred, _ = self.model(sensor_pos, iq_signal, doa_gt)
+            model_result = self.model(sensor_pos, iq_signal, doa_gt)
+            doa_pred, pos_pred = model_result["bearings"], model_result["source_estimated_position"]
 
         for sample_index in range(5):
-            visualize_ray_frame(
+            """visualize_ray_frame(
                 positions=sensor_pos[sample_index],  # (M, 2)
                 bearings=doa_pred[sample_index],  # (M,)
                 x_hat=pos_pred[sample_index],  # (2,)
@@ -286,8 +336,11 @@ class Trainer:
                 step=epoch,
                 save_path=f"visualizations/sample_{sample_index:03d}_epoch_{epoch:03d}.png"
             )
+            """
             import wandb
-            wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index], "pos_pred": pos_pred[sample_index], "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
+            #wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index], "pos_pred": pos_pred[sample_index], "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
+            wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index],
+                       "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
         if self.args.visualize and self.args.log_to_wandb:
 
             wandb.log({
@@ -319,6 +372,15 @@ def parse_args():
     p.add_argument("--lr_step_size", type=int, default=20)
     p.add_argument("--lr_gamma", type=float, default=0.2)
     p.add_argument("--val_freq", type=int, default=1, help="Validate every N epochs")
+    p.add_argument(
+        "--train_scopes",
+        nargs="+",
+        default=None,
+        help=(
+            "List of substrings of parameter names to train; others are frozen. "
+            "Example: --train_scopes subarray_models learned_attentaion"
+        ),
+    )
 
     # System / misc
     p.add_argument("--num_workers", type=int, default=0)
