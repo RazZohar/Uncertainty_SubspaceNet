@@ -831,9 +831,6 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
                 """
         # Feed surrogate covariance to Esprit algorithm
         doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
-        eigen_values = torch.stack([pair[0] for pair in estimated_subspace])
-        eigen_vectors = torch.stack([pair[1] for pair in estimated_subspace]) # shape: [N, D]
-        cov_doa = doa_covariance_from_eig(eigen_values, eigen_vectors, doa_prediction, self.T)
         return Rz, doa_prediction
 
     def sense_device_forward(self, x):

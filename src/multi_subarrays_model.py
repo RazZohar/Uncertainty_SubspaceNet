@@ -124,17 +124,19 @@ class MultiSubarraysModel(nn.Module):
             bearings.append(doa_pred)
 
         bearings = torch.stack(bearings, dim=1)
+        sigma_i_stack = torch.stack(sigma_i, dim=1)
 
 
         #TODO: Assosicate angles
-
-        #source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
+        with torch.no_grad():
+            #TODO: pass sigma and then
+            source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
 
         if self.args.train_doa_only:
             requested_values = {}
             requested_values["bearings"] = bearings
-            requested_values["source_estimated_position"] = (-5,-5)
-            requested_values["dop"] = None
+            requested_values["source_estimated_position"] = source_estimated_position
+            requested_values["dop"] = dop
             requested_values["sigma_i"] = sigma_i
             requested_values["phi_i"] = phi_i
             return requested_values
