@@ -15,33 +15,53 @@ from src.criterions import RMSPELoss
 # To match attenation layers
 from src.learned_agg_layer import match_learned_attn_shapes
 
+from torch.profiler import (
+    profile,
+    schedule,
+    tensorboard_trace_handler,
+    ProfilerActivity,
+    record_function,
+)
+
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, batch_size, doa_only):
+def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=None):
     model.eval()
     total_loss = 0.0
-    for sensor_positions, source_positions, samples, doa_gt in loader:
-        sensor_positions = sensor_positions.to(device)
-        source_positions = source_positions.to(device)
-        samples = samples.to(device)
-        doa_gt = torch.deg2rad(doa_gt).to(device)
+    loss = 0.0
+    for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
+        with record_function("eval_step"):
+            sensor_positions = sensor_positions.to(device)
+            source_positions = source_positions.to(device)
+            samples = samples.to(device)
+            doa_gt = torch.deg2rad(doa_gt).to(device)
 
-        if doa_only:
-            doa_pred, pos_pred, dop = model(sensor_positions, samples, doa_gt)
-            doa_pred = doa_pred.squeeze(dim=-1)
-            loss = criterion(doa_pred, doa_gt)
+            if doa_only:
+                with record_function("model_forward_doa"):
+                    model_result = model(sensor_positions, samples, doa_gt)
 
-        else:
-            pred = model(sensor_positions, samples, None)
-            loss = criterion(pred, source_positions)
+                    doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
 
-        total_loss += loss.item()
+                    for i in range(doa_gt.shape[1]):
+                        loss += criterion(doa_pred[:, i, :], doa_gt[:, i, :])
+
+
+            else:
+                with record_function("model_forward_pos"):
+                    pred = model(sensor_positions, samples, None)
+                loss = criterion(pred, source_positions)
+
+            total_loss += loss.item()
+
+        # advance profiler step at the end of each iteration
+        if profiler is not None:
+            profiler.step()
 
     return total_loss / (len(loader) * batch_size)
 
 
-def main():
-    parser = argparse.ArgumentParser("Test Multi‑Subarrays Model")
+def main(profiler=None):
+    parser = argparse.ArgumentParser("Test Multi-Subarrays Model")
     parser.add_argument("--test_dataset_path", required=True, help="Path to test dataset .pt file")
     parser.add_argument("--config_path", required=True, help="Path to YAML config file")
     parser.add_argument("--checkpoint_path", required=True, help="Path to model checkpoint")
@@ -88,8 +108,16 @@ def main():
     if args.log_to_wandb:
         wandb.init(project="multi-subarrays-doa", job_type="test")
 
-    # Evaluate
-    test_loss = evaluate(model, test_loader, criterion, device, batch_size=args.batch_size, doa_only=args.train_doa_only)
+    # Evaluate (optionally under profiler)
+    test_loss = evaluate(
+        model,
+        test_loader,
+        criterion,
+        device,
+        batch_size=args.batch_size,
+        doa_only=args.train_doa_only,
+        profiler=profiler,
+    )
     print(f"Test loss: {test_loss:.6f}")
 
     if args.log_to_wandb:
@@ -98,4 +126,8 @@ def main():
 
 
 if __name__ == "__main__":
+    activities = [ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(ProfilerActivity.CUDA)
+
     main()
