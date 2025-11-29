@@ -7,7 +7,7 @@ import numpy as np
 from .system_model import SystemModelParams
 from .models import SignalsSubspaceNetEsprit
 from .multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
-from .localization_block import RayIntersection, triangulation_with_soft_area_batched
+from .localization_block import RayIntersection, triangulation_with_soft_area_batched, position_errors
 from .learned_agg_layer import LearnedAgg
 from .uncertainty_block import UncertaintyEstimation
 
@@ -129,20 +129,27 @@ class MultiSubarraysModel(nn.Module):
 
         #TODO: Assosicate angles
         with torch.no_grad():
-            #TODO: pass sigma and then
+            #TODO: Foward both WLS and LS to compare
             source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
-            centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
+            source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
+            position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
+            #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
 
         if self.args.train_doa_only:
             requested_values = {}
             requested_values["bearings"] = bearings
             requested_values["source_estimated_position"] = source_estimated_position
+            requested_values["source_estimated_position_wls"] = source_estimated_position_wls
             requested_values["dop"] = dop
+            requested_values["dop_wls"] = dop_wls
             requested_values["sigma_i"] = sigma_i
             requested_values["phi_i"] = phi_i
+            requested_values["position_metrics"] = position_metrics
+            """
             requested_values["area"] = area_soft
             requested_values["centroid"] = centroid
             requested_values["Sigma_s"] = Sigma_s
+            """
             return requested_values
 
         #TODO: Assosicate angles

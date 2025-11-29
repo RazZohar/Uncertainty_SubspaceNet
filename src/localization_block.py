@@ -23,7 +23,13 @@ class RayIntersection(nn.Module):
         self.compute_gdop = compute_gdop
         self.eps = eps
 
-    def forward(self, positions: torch.Tensor, bearings: torch.Tensor):
+    def forward(self, positions: torch.Tensor, bearings: torch.Tensor, sigma=None):
+        if sigma is None:
+            return self.ls_intersection(positions, bearings)
+        else:
+            return self.weighted_ls_intersection(positions, bearings, sigma)
+
+    def ls_intersection(self, positions: torch.Tensor, bearings: torch.Tensor):
         B, M, _ = positions.shape
         eps = self.eps
 
@@ -87,6 +93,102 @@ class RayIntersection(nn.Module):
 
         return x_hat, gdop
 
+    def weighted_ls_intersection(self, positions: torch.Tensor, bearings: torch.Tensor, sigmas: torch.Tensor):
+        """
+        Weighted least-squares ray intersection.
+
+        positions : (B, M, 2)
+        bearings  : (B, M) or (B, M, K)  [rad]
+        sigmas    : scalar or same shape as `bearings`
+                    (std-dev of each bearing in radians)
+
+        Returns
+        -------
+        x_hat : (B, 2)       if bearings is (B, M)
+                (B, K, 2)    if bearings is (B, M, K)
+        gdop  : (B,)         or (B, K,) if self.compute_gdop is True, else None
+        """
+        B, M, _ = positions.shape
+        eps = self.eps
+        device = positions.device
+        dtype = positions.dtype
+
+        # ---------- normalize bearings shape to (B, M, K) ----------
+        if bearings.ndim == 2:
+            bearings = bearings.unsqueeze(-1)  # (B, M, 1)
+        elif bearings.ndim != 3:
+            raise ValueError(f"bearings must be (B, M) or (B, M, K), got {bearings.shape}")
+
+        B2, M2, K = bearings.shape
+        if B2 != B or M2 != M:
+            raise ValueError("positions and bearings batch/sensor dims must match")
+
+        # ---------- broadcast sigmas to (B, M, K) ----------
+        if not torch.is_tensor(sigmas):
+            sigmas = torch.full_like(bearings, float(sigmas))
+        else:
+            sigmas = sigmas.to(device=device, dtype=dtype)
+            if sigmas.ndim == 0:
+                sigmas = torch.full_like(bearings, sigmas)
+            elif sigmas.ndim == 2:  # (B, M) -> (B, M, 1)
+                sigmas = sigmas.unsqueeze(-1).expand_as(bearings)
+            elif sigmas.shape != bearings.shape:
+                sigmas = sigmas.expand_as(bearings)
+
+        # ---------- geometry: directions & normals ----------
+        # d : (B, M, K, 2)
+        d = torch.stack((torch.cos(bearings), torch.sin(bearings)), dim=-1)
+        # n = perpendiculars: (B, M, K, 2)
+        n = torch.stack((-d[..., 1], d[..., 0]), dim=-1)
+
+        # reorder to per-source layout: (B, K, M, 2)
+        n_bkm = n.permute(0, 2, 1, 3)  # normals
+        pos_bkm = positions.unsqueeze(1).expand(B, K, M, 2)
+
+        # line offsets c_m = n_m^T s_m  -> (B, K, M)
+        c = (n_bkm * pos_bkm).sum(dim=-1)
+
+        # ---------- weights from sigmas ----------
+        # w = 1 / sigma^2  (B, M, K) -> (B, K, M)
+        w = 1.0 / (sigmas.clamp_min(1e-4) ** 2)
+        w = w.permute(0, 2, 1)  # (B, K, M)
+
+        # To keep the normal equations symmetric & stable,
+        # we use sqrt(w) on the normals, and w on c:
+        sqrt_w = torch.sqrt(w)[..., None]  # (B, K, M, 1)
+        n_w = n_bkm * sqrt_w  # (B, K, M, 2)
+        c_w = c * w  # (B, K, M)
+
+        # ---------- normal equations: A x = b (per batch, per source) ----------
+        # A = Σ_m w_m n_m n_m^T     -> (B, K, 2, 2)
+        A = n_w.transpose(-1, -2) @ n_w
+
+        # b = Σ_m w_m n_m c_m       -> (B, K, 2)
+        b = (n_w.transpose(-1, -2) @ c_w.unsqueeze(-1)).squeeze(-1)
+
+        # regularization & solve
+        I = torch.eye(2, device=device, dtype=dtype).view(1, 1, 2, 2)  # (1,1,2,2)
+        A_reg = A + eps * I
+        A_inv = torch.linalg.pinv(A_reg)  # (B, K, 2, 2)
+
+        x_hat = (A_inv @ b.unsqueeze(-1)).squeeze(-1)  # (B, K, 2)
+
+        # If original bearings had shape (B, M), squash K dim for API compatibility
+        if bearings.shape[2] == 1:
+            x_hat = x_hat.squeeze(1)  # (B, 2)
+
+        # ---------- GDOP (optional) ----------
+        if self.compute_gdop:
+            with torch.no_grad():
+                # trace(inv(A)) per batch & source
+                trace = A_inv.diagonal(dim1=-2, dim2=-1).sum(-1)  # (B, K)
+                gdop = torch.sqrt(trace)
+                if gdop.shape[1] == 1:
+                    gdop = gdop.squeeze(1)  # (B,)
+        else:
+            gdop = None
+
+        return x_hat, gdop
 
 
 import torch
@@ -210,3 +312,26 @@ def triangulation_with_soft_area_batched(
     area_soft = torch.pi * torch.sqrt(det_S)              # (B, T)
 
     return s, area_soft, Sigma_s
+
+
+def position_errors(est, est_wls, gt):
+    # est, est_wls: [B, S, 2]
+    # gt: [B, 2, S]  -> convert
+    gt_xy = gt.permute(0, 2, 1)  # [B, S, 2]
+
+    ls_err  = torch.linalg.norm(est     - gt_xy, dim=-1)  # [B, S]
+    wls_err = torch.linalg.norm(est_wls - gt_xy, dim=-1)  # [B, S]
+
+    ls_rmse_per_source = torch.sqrt((ls_err ** 2).mean(dim=0))  # [S]
+    wls_rmse_per_source = torch.sqrt((wls_err ** 2).mean(dim=0))  # [S]
+
+    metrics = {
+        "ls_mae":  ls_err.mean(),
+        "ls_rmse": torch.sqrt((ls_err ** 2).mean()),
+        "wls_mae":  wls_err.mean(),
+        "wls_rmse": torch.sqrt((wls_err ** 2).mean()),
+        "ls_rmse_per_source" : ls_rmse_per_source,
+        "wls_rmse_per_source" : wls_rmse_per_source
+    }
+    return ls_err, wls_err, metrics
+
