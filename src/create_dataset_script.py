@@ -18,12 +18,12 @@ import torch
 def create_dataset():
     """Create and save the dataset"""
     # Parameters
-    domain = ((0, 10), (0, 10))  # (x range, y range)
-    n_sensors = 2
+    domain = ((0, 30), (0, 30))  # (x range, y range)
+    n_sensors = 3
     n_sources = 3
     d_sensor_sensor = 1.0
-    d_source_source = 1.5
-    d_sensor_source = 2.5
+    d_source_source = 6.0
+    d_sensor_source = 3.5
 
     print("Setting unified seed...")
     set_unified_seed()
@@ -31,6 +31,7 @@ def create_dataset():
     DATASET_TRAIN_SIZE = 50000
     #DATASET_TRAIN_SIZE = 5
     DATASET_TEST_SIZE = int(DATASET_TRAIN_SIZE * 0.1)
+
 
     print("Creating dataset...")
     dataset = SensorSourceGraphDataset(
@@ -67,12 +68,12 @@ def create_dataset():
         '/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset_test.pkl')
 
     print("Dataset created successfully!")
-    print(f"Dataset length: {len(dataset_load)}")
+    #print(f"Dataset length: {len(dataset_load)}")
     print(f"Number of sensors: {n_sensors}")
     print(f"Number of sources: {n_sources}")
-    print(dataset_load)
-    print(dataset_load.__getitem__(0))
-
+    #print(dataset_load)
+    #print(dataset_load.__getitem__(0))
+    """
     dataset_load.use_graph_features = True
     for idx, item in enumerate(dataset_load):
         if item[1][0][0] > 8:
@@ -81,6 +82,6 @@ def create_dataset():
             break
 #        if idx > 200:
 #            break
-
+    """
 if __name__ == '__main__':
     create_dataset() 

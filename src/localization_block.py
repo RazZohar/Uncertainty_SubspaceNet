@@ -150,7 +150,19 @@ class RayIntersection(nn.Module):
 
         # ---------- weights from sigmas ----------
         # w = 1 / sigma^2  (B, M, K) -> (B, K, M)
-        w = 1.0 / (sigmas.clamp_min(1e-4) ** 2)
+        #w = 1.0 / (sigmas.clamp_min(1e-4) ** 2)
+        # sigmas: [B, M, K]  (std dev in radians, predicted by network)
+
+        min_sigma = 1e-4
+        sig = sigmas.clamp_min(min_sigma)
+
+        w_raw = 1.0 / (sig ** 2 + 1e-9)  # large sigma -> small w_raw, correct
+
+        # normalise along sensors (K) for each (B, M)
+        w_mean = w_raw.mean(dim=2, keepdim=True) + 1e-9  # [B, 1, K]
+        w = w_raw / w_mean
+        w = w.clamp(min=0.1, max=10.0)  # tune 0.1 and 10
+
         w = w.permute(0, 2, 1)  # (B, K, M)
 
         # To keep the normal equations symmetric & stable,

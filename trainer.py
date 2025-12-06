@@ -328,15 +328,15 @@ class Trainer:
             doa_pred, pos_pred = model_result["bearings"], model_result["source_estimated_position"]
 
         for sample_index in range(5):
-            """visualize_ray_frame(
+            visualize_ray_frame(
                 positions=sensor_pos[sample_index],  # (M, 2)
                 bearings=doa_pred[sample_index],  # (M,)
                 x_hat=pos_pred[sample_index],  # (2,)
-                x_true=source_pos[sample_index, 0],  # (2,)
+                x_true=source_pos[sample_index],  # (2,)
                 step=epoch,
                 save_path=f"visualizations/sample_{sample_index:03d}_epoch_{epoch:03d}.png"
             )
-            """
+
             import wandb
             #wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index], "pos_pred": pos_pred[sample_index], "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
             wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index],

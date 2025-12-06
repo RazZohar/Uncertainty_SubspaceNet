@@ -465,8 +465,8 @@ class SubspaceNet(nn.Module):
         self.conv2 = nn.Conv2d(32, 32, kernel_size=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=2)
 
-        self.batchnorm1 = nn.BatchNorm2d(16)
-        self.batchnorm2 = nn.BatchNorm2d(32)
+        #self.batchnorm1 = nn.BatchNorm2d(16)
+        #self.batchnorm2 = nn.BatchNorm2d(32)
 
         self.anti_rectifier_layer = AntiRectifierLayer(self.anti_rectifier)
 
@@ -744,8 +744,8 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         # TODO: check sizes of Conv
 
 
-        self.batchnorm1 = nn.BatchNorm2d(16)
-        self.batchnorm2 = nn.BatchNorm2d(32)
+        #self.batchnorm1 = nn.BatchNorm2d(16)
+        #self.batchnorm2 = nn.BatchNorm2d(32)
         self.complex_rectifier = ComplexReLU(self.anti_rectifier)
 
         self.anti_rectifier_layer = AntiRectifierLayer(self.complex_rectifier)

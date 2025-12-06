@@ -43,6 +43,10 @@ class MultiSubarraysModel(nn.Module):
         # Doa Assosication block
         self.rays_intersection = RayIntersection()
 
+        # Change Those flags by train/inference iterations
+        self.estimate_uncertainty = False
+        self.fuse_sensors = False
+
 
 
 
@@ -102,49 +106,59 @@ class MultiSubarraysModel(nn.Module):
             vq_loss , q_quantized = self.subarray_models[subarray_index].sense_device_forward(iq_signals)
             q_i.append(q_quantized)
 
-        # TODO: Later add option to work in stages with arguments
         q_i_stack = torch.stack(q_i, dim=1)
-        with torch.no_grad():
-            # TODO: add attention between subarrays
-            z_i = []
-            phi_i = []
-            for subarray_index in range(self.number_of_sensors):
-                z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
-                z_i.insert(subarray_index, z)
-                phi_i.insert(subarray_index, phi)
+        # TODO: Later add option to work in stages with arguments
+        if self.fuse_sensors is True:
+            with torch.no_grad():
+                # TODO: add attention between subarrays
+                z_i = []
+                phi_i = []
+                for subarray_index in range(self.number_of_sensors):
+                    z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
+                    z_i.insert(subarray_index, z)
+                    phi_i.insert(subarray_index, phi)
 
-        z_i_stack = torch.stack(z_i, dim=1)
+            z_i_stack = torch.stack(z_i, dim=1)
         sigma_i = []
         for subarray_index in range(self.number_of_sensors):
             R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
 
-            with torch.no_grad():
-                sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
-                sigma_i.insert(subarray_index, sigma)
             bearings.append(doa_pred)
+            if self.estimate_uncertainty is True:
+                with torch.no_grad():
+                    sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
+                    sigma_i.insert(subarray_index, sigma)
+
 
         bearings = torch.stack(bearings, dim=1)
-        sigma_i_stack = torch.stack(sigma_i, dim=1)
+        if self.estimate_uncertainty is True:
+            sigma_i_stack = torch.stack(sigma_i, dim=1)
 
 
         #TODO: Assosicate angles
         with torch.no_grad():
             #TODO: Foward both WLS and LS to compare
             source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
-            source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
-            position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
+            if self.estimate_uncertainty is True:
+                source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
+                position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
             #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
 
         if self.args.train_doa_only:
             requested_values = {}
             requested_values["bearings"] = bearings
             requested_values["source_estimated_position"] = source_estimated_position
-            requested_values["source_estimated_position_wls"] = source_estimated_position_wls
             requested_values["dop"] = dop
-            requested_values["dop_wls"] = dop_wls
-            requested_values["sigma_i"] = sigma_i
-            requested_values["phi_i"] = phi_i
-            requested_values["position_metrics"] = position_metrics
+
+            if self.fuse_sensors is True:
+                requested_values["phi_i"] = phi_i
+
+            if self.estimate_uncertainty is True:
+                requested_values["source_estimated_position_wls"] = source_estimated_position_wls
+                requested_values["dop_wls"] = dop_wls
+                requested_values["sigma_i"] = torch.deg2rad(sigma_i_stack.sqrt())
+
+                requested_values["position_metrics"] = position_metrics
             """
             requested_values["area"] = area_soft
             requested_values["centroid"] = centroid
@@ -157,6 +171,12 @@ class MultiSubarraysModel(nn.Module):
         # Intersect rays
         #return bearings, source_estimated_position, dop
         #return source_estimated_position
+
+    def enable_fuse_sensors(self):
+        self.fuse_sensors = True
+
+    def enable_uncetainty_estimation(self):
+        self.estimate_uncertainty = True
 
 
 if __name__ == '__main__':

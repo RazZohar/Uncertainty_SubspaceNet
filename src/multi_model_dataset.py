@@ -113,8 +113,8 @@ def draw_graph_with_precomputed_angles(G):
     plt.title("Sensor-Source Graph with Precomputed Angle Labels")
 
     # TODO: limit by the domain
-    plt.xlim((0,10))
-    plt.ylim((-0.1, 10))
+    plt.xlim((0,100))
+    plt.ylim((-0.1, 100))
 
     plt.legend()
     plt.gca().set_aspect('equal')
@@ -144,9 +144,43 @@ def visualize_localization_scene(sensor_positions, source_positions):
     plt.grid(True)
     plt.show()
 
+def check_angle_separation(relative_angles,
+                           min_angle_sep_rad,
+                           sensor_indices=None):
+    """
+    relative_angles: (n_sensors, n_sources) in radians
+    min_angle_sep_rad: minimal allowed separation (radians)
+    sensor_indices: iterable of sensor indices to enforce on,
+                    or None for all sensors
+    """
+    n_sensors, n_sources = relative_angles.shape
 
-def create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, domain, n_sensors, n_sources, sensor_positions=None):
+    if sensor_indices is None:
+        sensor_indices = range(n_sensors)
 
+    for i in sensor_indices:
+        for j in range(n_sources):
+            for k in range(j + 1, n_sources):
+                a1 = relative_angles[i, j]
+                a2 = relative_angles[i, k]
+                # minimal angular difference in [0, pi]
+                diff = np.abs(np.arctan2(np.sin(a1 - a2), np.cos(a1 - a2)))
+                if diff < min_angle_sep_rad:
+                    return False
+    return True
+
+def create_single_graph_data(
+    d_sensor_sensor,
+    d_sensor_source,
+    d_source_source,
+    domain,
+    n_sensors,
+    n_sources,
+    sensor_positions=None,
+    min_angle_sep_deg=None,      # NEW: minimal separation in degrees
+    sep_sensor_indices=None,     # NEW: which sensors to enforce on (None = all)
+    max_angle_attempts=5000      # NEW: max re-sampling attempts
+):
     if sensor_positions is None:
         # Step 1: Generate sensors
         sensor_positions = generate_points_with_gap(
@@ -154,19 +188,48 @@ def create_single_graph_data(d_sensor_sensor, d_sensor_source, d_source_source, 
             d_self=d_sensor_sensor,
             domain=domain
         )
-    # Step 2: Generate sources with respect to sensors
-    source_positions = generate_points_with_gap(
-        n_points=n_sources,
-        d_self=d_source_source,
-        domain=domain,
-        other_pts=sensor_positions,
-        d_other=d_sensor_source
-    )
-    # Compute relative angles
-    relative_angles = compute_relative_angles(sensor_positions, source_positions)
 
-    model_graph = create_sensor_source_graph(sensor_positions, source_positions, np.degrees(relative_angles))
+    # Step 2: Generate sources with respect to sensors,
+    #         but enforce angular separation if requested
+    attempts = 0
+    while True:
+        source_positions = generate_points_with_gap(
+            n_points=n_sources,
+            d_self=d_source_source,
+            domain=domain,
+            other_pts=sensor_positions,
+            d_other=d_sensor_source
+        )
+
+        # Always compute relative angles; we might need them for the constraint
+        relative_angles = compute_relative_angles(sensor_positions, source_positions)
+
+        if min_angle_sep_deg is None:
+            # No angle constraint -> accept immediately
+            break
+
+        min_angle_sep_rad = 0.2#np.deg2rad(min_angle_sep_deg)
+        if check_angle_separation(relative_angles,
+                                  min_angle_sep_rad,
+                                  sensor_indices=sep_sensor_indices):
+            # Configuration satisfies angle constraint
+            break
+
+        attempts += 1
+        if attempts >= max_angle_attempts:
+            raise RuntimeError(
+                f"Could not sample sources satisfying angular separation "
+                f">= {min_angle_sep_deg}° after {max_angle_attempts} attempts."
+            )
+
+    # At this point, source_positions + relative_angles satisfy the constraints
+    model_graph = create_sensor_source_graph(
+        sensor_positions,
+        source_positions,
+        np.degrees(relative_angles)
+    )
     return model_graph, sensor_positions, source_positions, relative_angles
+
 
 
 class SensorSourceGraphDataset(Dataset):
@@ -188,6 +251,7 @@ class SensorSourceGraphDataset(Dataset):
         self.__samples_model = Samples(self.__system_model_params)
 
         #TODO: we limit the source to be on X axis
+        #source_domain = ((domain[0][0], domain[0][1]), (domain[1][0], domain[1][1]))
         source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
         self._sensor_position = generate_points_with_gap(
             n_points=n_sensors,
@@ -205,7 +269,8 @@ class SensorSourceGraphDataset(Dataset):
 
         # Fix the domain of sources locations
         #domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
-        domain = (x_min, domain[0][1]), (y_max, domain[1][1])
+        #domain = (x_min + 2, domain[0][1]), (5.0, domain[1][1])
+        domain = (40, 100), (5.0, domain[1][1])
 
         for dataset_index in range(D):
 
@@ -213,7 +278,8 @@ class SensorSourceGraphDataset(Dataset):
             model_graph, sensor_positions, source_positions, relative_angles = create_single_graph_data(d_sensor_sensor, d_sensor_source,
                                                                                        d_source_source, domain,
                                                                                        n_sensors,
-                                                                                       n_sources, sensor_positions=self._sensor_position)
+                                                                                       n_sources, sensor_positions=self._sensor_position,
+                                                                                                        min_angle_sep_deg=15.0)
 
             print(f'{sensor_positions=}, {source_positions=}, {relative_angles=}')
             #draw_graph_with_precomputed_angles(model_graph)
@@ -221,7 +287,7 @@ class SensorSourceGraphDataset(Dataset):
             samples_graphs = []
             scene_model_dataset = []
             scene_generic_dataset = []
-            relative_angles = np.degrees(relative_angles)
+            relative_angles = np.degrees(relative_angles) - 90.0
             # Generate I-Q signals due to the sample model
             for index in range(n_sensors):
 
