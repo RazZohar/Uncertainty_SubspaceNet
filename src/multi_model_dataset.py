@@ -235,7 +235,7 @@ def create_single_graph_data(
 class SensorSourceGraphDataset(Dataset):
     def __init__(self, D, n_sensors, n_sources,
                  d_sensor_sensor, d_source_source, d_sensor_source,
-                 domain, configuration_file):
+                 domain, configuration_file, sensor_positions=None):
         self.samples_graphs = []
         self.localization_scene = []
         self.use_graph_features = False  # Default to using original graphs
@@ -253,11 +253,15 @@ class SensorSourceGraphDataset(Dataset):
         #TODO: we limit the source to be on X axis
         #source_domain = ((domain[0][0], domain[0][1]), (domain[1][0], domain[1][1]))
         source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
-        self._sensor_position = generate_points_with_gap(
-            n_points=n_sensors,
-            d_self=d_sensor_sensor,
-            domain=source_domain
-            )
+
+        if sensor_positions is None:
+            self._sensor_position = generate_points_with_gap(
+                n_points=n_sensors,
+                d_self=d_sensor_sensor,
+                domain=source_domain
+                )
+        else:
+            self._sensor_position = sensor_positions
 
 
 

@@ -46,6 +46,7 @@ class MultiSubarraysModel(nn.Module):
         # Change Those flags by train/inference iterations
         self.estimate_uncertainty = False
         self.fuse_sensors = False
+        self.estimate_position = False
 
 
 
@@ -138,27 +139,33 @@ class MultiSubarraysModel(nn.Module):
         #TODO: Assosicate angles
         with torch.no_grad():
             #TODO: Foward both WLS and LS to compare
-            source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
-            if self.estimate_uncertainty is True:
-                source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
-                position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
-            #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
+            if self.estimate_position is True:
+                source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
+                if self.estimate_uncertainty is True:
+                    source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
+                    position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
+                #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
 
         if self.args.train_doa_only:
             requested_values = {}
             requested_values["bearings"] = bearings
-            requested_values["source_estimated_position"] = source_estimated_position
-            requested_values["dop"] = dop
+
 
             if self.fuse_sensors is True:
                 requested_values["phi_i"] = phi_i
 
             if self.estimate_uncertainty is True:
-                requested_values["source_estimated_position_wls"] = source_estimated_position_wls
-                requested_values["dop_wls"] = dop_wls
                 requested_values["sigma_i"] = torch.deg2rad(sigma_i_stack.sqrt())
 
+
+
+            if self.estimate_uncertainty is True and self.estimate_position is True:
                 requested_values["position_metrics"] = position_metrics
+                requested_values["source_estimated_position"] = source_estimated_position
+                requested_values["dop"] = dop
+                requested_values["source_estimated_position_wls"] = source_estimated_position_wls
+                requested_values["dop_wls"] = dop_wls
+
             """
             requested_values["area"] = area_soft
             requested_values["centroid"] = centroid

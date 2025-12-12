@@ -34,7 +34,7 @@ def create_dataset():
 
 
     print("Creating dataset...")
-    dataset = SensorSourceGraphDataset(
+    """dataset = SensorSourceGraphDataset(
         D=DATASET_TRAIN_SIZE,
         n_sensors=n_sensors,
         n_sources=n_sources,
@@ -44,9 +44,9 @@ def create_dataset():
         domain=domain,
         configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
     )
-
+    """
     print("Saving dataset...")
-    dataset.save_to_file('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
+    #dataset.save_to_file('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
 
     print("Loading dataset to verify...")
     dataset_load = torch.load('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
@@ -60,7 +60,8 @@ def create_dataset():
         d_source_source=d_source_source,
         d_sensor_source=d_sensor_source,
         domain=domain,
-        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
+        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json',
+        sensor_positions=dataset_load._sensor_position
     )
 
     print("Saving dataset...")

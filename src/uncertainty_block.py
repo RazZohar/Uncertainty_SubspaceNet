@@ -816,4 +816,4 @@ class UncertaintyEstimation(nn.Module):
         uncertainty = torch.zeros_like(doas_deg)
         for index in range(doas_deg.shape[0]):
             uncertainty[index] = self.compute_predicated_uncertainty(doas_deg[index], Rx[index])
-        return np.sqrt(uncertainty)
+        return torch.sqrt(uncertainty)

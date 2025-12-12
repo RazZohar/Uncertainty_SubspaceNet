@@ -108,7 +108,7 @@ def visualize_ray_frame(positions,
         y_s = float(y_s)
 
         for m in range(M):
-            theta = float(bearings[k, m])  # radians
+            theta = float(bearings[k, m])   + (np.pi / 2)# radians +
             color = colors[m]
 
             # central ray

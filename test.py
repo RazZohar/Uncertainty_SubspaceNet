@@ -43,7 +43,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                 with record_function("model_forward_doa"):
                     model_result = model(sensor_positions, samples, doa_gt)
 
-                    doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
+                    #doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
+                    doa_pred = model_result["bearings"]
                     sigma_pred = model_result["sigma_i"]
 
                     for i in range(doa_gt.shape[1]):
@@ -53,9 +54,11 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         visualize_ray_frame(
                             positions=sensor_positions[sample_index],  # (M, 2)
                             bearings=doa_pred[sample_index],  # (M,)
-                            x_hat=pos_pred[sample_index],  # (2,)
+                            #x_hat=pos_pred[sample_index],  # (2,)
+                            x_hat=torch.zeros_like(source_positions[sample_index]),
                             x_true=source_positions[sample_index],  # (2,)
                             sigmas=sigma_pred[sample_index],
+                            #sigmas=torch.zeros_like(doa_pred[sample_index]),
                             step=step,
                             save_path=f"visualizations/sample_{sample_index:03d}_test_{step:03d}.png"
                         )
@@ -111,6 +114,9 @@ def main(profiler=None):
         multi_model_configuration=args.config_path,
         args=args
     ).to(device)
+
+    # Estimate the uncertainty
+    model.estimate_uncertainty = True
 
     # Load best checkpoint
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
