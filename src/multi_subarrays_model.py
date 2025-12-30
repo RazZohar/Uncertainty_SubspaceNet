@@ -122,18 +122,28 @@ class MultiSubarraysModel(nn.Module):
             z_i_stack = torch.stack(z_i, dim=1)
         sigma_i = []
         for subarray_index in range(self.number_of_sensors):
-            R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+            # if we need to fuse sensor use z_i instead of q_i
+            if self.fuse_sensors is False:
+                R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+            else:
+                R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(
+                    z_i_stack[:, subarray_index, :, :])
 
             bearings.append(doa_pred)
             if self.estimate_uncertainty is True:
                 with torch.no_grad():
-                    sigma = self.uncertainty_pred[subarray_index].forward(doa_pred.rad2deg(), R)
+                    sigma = self.uncertainty_pred[subarray_index].forward((doa_pred + (torch.pi/2)).rad2deg(), R)
                     sigma_i.insert(subarray_index, sigma)
 
 
         bearings = torch.stack(bearings, dim=1)
+
+        # Sort the bearing by [Batch, L(subarray), M(targets)] by targets
+        bearings, bearings_order_index = torch.sort(bearings, dim=2)
         if self.estimate_uncertainty is True:
             sigma_i_stack = torch.stack(sigma_i, dim=1)
+            sigma_i_stack = torch.gather(sigma_i_stack, dim=2, index=bearings_order_index)
+
 
 
         #TODO: Assosicate angles
@@ -143,7 +153,7 @@ class MultiSubarraysModel(nn.Module):
                 source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
                 if self.estimate_uncertainty is True:
                     source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
-                    position_metrics = position_errors(source_estimated_position, source_estimated_position_wls, gt_pos)
+
                 #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
 
         if self.args.train_doa_only:
@@ -160,7 +170,6 @@ class MultiSubarraysModel(nn.Module):
 
 
             if self.estimate_uncertainty is True and self.estimate_position is True:
-                requested_values["position_metrics"] = position_metrics
                 requested_values["source_estimated_position"] = source_estimated_position
                 requested_values["dop"] = dop
                 requested_values["source_estimated_position_wls"] = source_estimated_position_wls

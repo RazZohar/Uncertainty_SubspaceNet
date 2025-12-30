@@ -14,6 +14,7 @@ from src.criterions import RMSPELoss
 
 # To match attenation layers
 from src.learned_agg_layer import match_learned_attn_shapes
+from src.localization_block import position_errors
 
 from src.visualization import visualize_ray_frame
 
@@ -43,9 +44,21 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                 with record_function("model_forward_doa"):
                     model_result = model(sensor_positions, samples, doa_gt)
 
+
                     #doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
                     doa_pred = model_result["bearings"]
                     sigma_pred = model_result["sigma_i"]
+
+                    if model.estimate_position is True:
+                        pos_pred = model_result["source_estimated_position"]
+                        if model.estimate_uncertainty is True:
+                            position_metrics = position_errors(model_result["source_estimated_position"], model_result["source_estimated_position_wls"],
+                                                           source_positions)
+                            model_result["position_metrics"] = position_metrics
+
+                    else:
+                        pos_pred = torch.zeros_like(source_positions[sample_index])
+
 
                     for i in range(doa_gt.shape[1]):
                         loss += criterion(doa_pred[:, i, :], doa_gt[:, i, :])
@@ -54,8 +67,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         visualize_ray_frame(
                             positions=sensor_positions[sample_index],  # (M, 2)
                             bearings=doa_pred[sample_index],  # (M,)
-                            #x_hat=pos_pred[sample_index],  # (2,)
-                            x_hat=torch.zeros_like(source_positions[sample_index]),
+                            x_hat=pos_pred[sample_index],  # (2,)
                             x_true=source_positions[sample_index],  # (2,)
                             sigmas=sigma_pred[sample_index],
                             #sigmas=torch.zeros_like(doa_pred[sample_index]),
@@ -117,6 +129,7 @@ def main(profiler=None):
 
     # Estimate the uncertainty
     model.estimate_uncertainty = True
+    model.estimate_position = True
 
     # Load best checkpoint
     checkpoint = torch.load(args.checkpoint_path, map_location=device)

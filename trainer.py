@@ -232,8 +232,8 @@ class Trainer:
                 # of source i from sensor array [subarray_index]
                 if self.args.train_doa_only:
                     model_result = self.model(sensor_positions, samples, doa_gt)
-                    doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
-                    #doa_pred, pos_pred, dop = self.model(sensor_positions, samples, doa_gt)
+                    #doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
+                    doa_pred = model_result["bearings"]
                     #doa_pred = doa_pred.squeeze(dim=-1)
                     #loss = self.criterion(doa_pred, doa_gt)
                     for i in range(doa_gt.shape[1]):
@@ -295,6 +295,10 @@ class Trainer:
             from src.visualization import create_sample_gif
             create_sample_gif(sample_idx=self.args.visualize_sample_index)
 
+            for index in range(5):
+                create_sample_gif(sample_idx=index)
+
+
     # ---------------------------------------------------------------------
     def get_fixed_batch(self, batch_size=100, start_index=0):
         # Subset maps logical index → real dataset index
@@ -325,13 +329,15 @@ class Trainer:
 
         with torch.no_grad():
             model_result = self.model(sensor_pos, iq_signal, doa_gt)
-            doa_pred, pos_pred = model_result["bearings"], model_result["source_estimated_position"]
+            #doa_pred, pos_pred = model_result["bearings"], model_result["source_estimated_position"]
+            doa_pred = model_result["bearings"]
 
         for sample_index in range(5):
             visualize_ray_frame(
                 positions=sensor_pos[sample_index],  # (M, 2)
                 bearings=doa_pred[sample_index],  # (M,)
-                x_hat=pos_pred[sample_index],  # (2,)
+                #x_hat=pos_pred[sample_index],  # (2,)
+                x_hat=torch.zeros_like(source_pos[sample_index]),
                 x_true=source_pos[sample_index],  # (2,)
                 step=epoch,
                 save_path=f"visualizations/sample_{sample_index:03d}_epoch_{epoch:03d}.png"
@@ -340,7 +346,7 @@ class Trainer:
             import wandb
             #wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index], "pos_pred": pos_pred[sample_index], "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
             wandb.log({"epoch": epoch, "doa_pred": doa_pred[sample_index],
-                       "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index, 0]})
+                       "doa_gt": doa_gt[sample_index], "pos_gt": source_pos[sample_index]})
         if self.args.visualize and self.args.log_to_wandb:
 
             wandb.log({

@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import math
+import itertools
 
 class RayIntersection(nn.Module):
     """
@@ -24,6 +25,9 @@ class RayIntersection(nn.Module):
         self.eps = eps
 
     def forward(self, positions: torch.Tensor, bearings: torch.Tensor, sigma=None):
+        # cos and sin functions of torch are realtive to X Axis while our angle is realtive to the "imaginary Axis"
+        bearings = bearings + (torch.pi / 2)
+
         if sigma is None:
             return self.ls_intersection(positions, bearings)
         else:
@@ -326,24 +330,40 @@ def triangulation_with_soft_area_batched(
     return s, area_soft, Sigma_s
 
 
+def permute_to_min_error(est, gt):
+    # est, gt: [B, S, 2]
+    B, S, D = est.shape
+    perms = torch.tensor(list(itertools.permutations(range(S))),
+                         device=est.device, dtype=torch.long)   # [P, S]
+
+    # est_perm: [B, P, S, 2]
+    est_perm = est[:, perms, :]
+    # err_per_perm: [B, P]  (sum over S)
+    err_per_perm = torch.linalg.norm(est_perm - gt[:, None, :, :], dim=-1).sum(dim=-1)
+
+    best_p = err_per_perm.argmin(dim=1)          # [B]
+    best_perm = perms[best_p]                    # [B, S]
+
+    est_best = est.gather(1, best_perm[..., None].expand(-1, -1, D))  # [B, S, 2]
+    return est_best, best_perm
+
 def position_errors(est, est_wls, gt):
-    # est, est_wls: [B, S, 2]
-    # gt: [B, 2, S]  -> convert
-    gt_xy = gt.permute(0, 2, 1)  # [B, S, 2]
+    # est, est_wls, gt: [B, S, 2]
+    with torch.no_grad():
+        est,  perm = permute_to_min_error(est, gt)
+        est_wls = est_wls.gather(1, perm[..., None].expand(-1, -1, 2))  # same perm
 
-    ls_err  = torch.linalg.norm(est     - gt_xy, dim=-1)  # [B, S]
-    wls_err = torch.linalg.norm(est_wls - gt_xy, dim=-1)  # [B, S]
-
-    ls_rmse_per_source = torch.sqrt((ls_err ** 2).mean(dim=0))  # [S]
-    wls_rmse_per_source = torch.sqrt((wls_err ** 2).mean(dim=0))  # [S]
+    ls_err  = torch.linalg.norm(est     - gt, dim=-1)  # [B, S]
+    wls_err = torch.linalg.norm(est_wls - gt, dim=-1)  # [B, S]
 
     metrics = {
         "ls_mae":  ls_err.mean(),
         "ls_rmse": torch.sqrt((ls_err ** 2).mean()),
         "wls_mae":  wls_err.mean(),
         "wls_rmse": torch.sqrt((wls_err ** 2).mean()),
-        "ls_rmse_per_source" : ls_rmse_per_source,
-        "wls_rmse_per_source" : wls_rmse_per_source
+        "ls_rmse_per_source":  torch.sqrt((ls_err  ** 2).mean(dim=0)),
+        "wls_rmse_per_source": torch.sqrt((wls_err ** 2).mean(dim=0)),
+        "perm": perm,  # [B, S]
     }
     return ls_err, wls_err, metrics
 

@@ -18,7 +18,7 @@ import torch
 def create_dataset():
     """Create and save the dataset"""
     # Parameters
-    domain = ((0, 30), (0, 30))  # (x range, y range)
+    domain = ((0, 100), (0, 100))  # (x range, y range)
     n_sensors = 3
     n_sources = 3
     d_sensor_sensor = 1.0
@@ -29,12 +29,12 @@ def create_dataset():
     set_unified_seed()
 
     DATASET_TRAIN_SIZE = 50000
-    #DATASET_TRAIN_SIZE = 5
+    #DATASET_TRAIN_SIZE = 50
     DATASET_TEST_SIZE = int(DATASET_TRAIN_SIZE * 0.1)
 
 
     print("Creating dataset...")
-    """dataset = SensorSourceGraphDataset(
+    dataset = SensorSourceGraphDataset(
         D=DATASET_TRAIN_SIZE,
         n_sensors=n_sensors,
         n_sources=n_sources,
@@ -44,11 +44,11 @@ def create_dataset():
         domain=domain,
         configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
     )
-    """
-    print("Saving dataset...")
-    #dataset.save_to_file('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
 
-    print("Loading dataset to verify...")
+    print("Saving dataset...")
+    dataset.save_to_file('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl')
+
+    print("Loading dataset to verify..   .")
     dataset_load = torch.load('/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/data/MultiSubArrays/SensorSourceGraphDataset.pkl', weights_only=False)
 
     print("Creating test dataset...")

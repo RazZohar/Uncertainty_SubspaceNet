@@ -145,7 +145,7 @@ def visualize_ray_frame(positions,
     for m in range(M):
         color = colors[m]
         # estimated
-        """ax.plot(
+        ax.plot(
             x_hat[m, 0], x_hat[m, 1],
             marker='o',
             color=color,
@@ -153,7 +153,7 @@ def visualize_ray_frame(positions,
             label=f'Estimated source {m}' if not est_label_used[m] else None
         )
         est_label_used[m] = True
-        """
+
         # true
         if x_true is not None:
             ax.plot(

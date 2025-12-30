@@ -114,7 +114,7 @@ def draw_graph_with_precomputed_angles(G):
 
     # TODO: limit by the domain
     plt.xlim((0,100))
-    plt.ylim((-0.1, 100))
+    plt.ylim((-0.1, 170))
 
     plt.legend()
     plt.gca().set_aspect('equal')
@@ -179,7 +179,7 @@ def create_single_graph_data(
     sensor_positions=None,
     min_angle_sep_deg=None,      # NEW: minimal separation in degrees
     sep_sensor_indices=None,     # NEW: which sensors to enforce on (None = all)
-    max_angle_attempts=5000      # NEW: max re-sampling attempts
+    max_angle_attempts=7000      # NEW: max re-sampling attempts
 ):
     if sensor_positions is None:
         # Step 1: Generate sensors
@@ -230,7 +230,9 @@ def create_single_graph_data(
     )
     return model_graph, sensor_positions, source_positions, relative_angles
 
-
+# This variable is used as the minimal seperation between the sensor
+# with greatest y axis placement to create a seperation between source and sensors
+MINIMAL_WIDTH_SOURCES = 30
 
 class SensorSourceGraphDataset(Dataset):
     def __init__(self, D, n_sensors, n_sources,
@@ -251,8 +253,8 @@ class SensorSourceGraphDataset(Dataset):
         self.__samples_model = Samples(self.__system_model_params)
 
         #TODO: we limit the source to be on X axis
-        #source_domain = ((domain[0][0], domain[0][1]), (domain[1][0], domain[1][1]))
-        source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
+        source_domain = ((domain[0][0], domain[0][1]), (domain[1][0], domain[1][1]))
+        #source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
 
         if sensor_positions is None:
             self._sensor_position = generate_points_with_gap(
@@ -267,14 +269,19 @@ class SensorSourceGraphDataset(Dataset):
 
         # Put the sources in front of the sensors
         y_max = max(self._sensor_position, key=lambda x:x[1])[1]
+        #y_min = min(self._sensor_position, key=lambda x: x[1])[1]
 
         # Put the sources at RHS of the sensor in order to allow -pi/2,pi/2
-        x_min = max(self._sensor_position, key=lambda x: x[0])[0]
+        x_max = max(self._sensor_position, key=lambda x: x[0])[0]
+        x_min = min(self._sensor_position, key=lambda x: x[0])[0]
 
         # Fix the domain of sources locations
+
+        #domain = (x_min, x_max), (y_max + 0.5 *MINIMAL_WIDTH_SOURCES, source_domain[1][1] + 2 * MINIMAL_WIDTH_SOURCES)
+        domain = (source_domain[0][0], source_domain[0][1]), (y_max + 0.5 * MINIMAL_WIDTH_SOURCES, source_domain[1][1] + 2 * MINIMAL_WIDTH_SOURCES)
         #domain = (domain[0][0], domain[0][1]), (y_max, domain[1][1])
         #domain = (x_min + 2, domain[0][1]), (5.0, domain[1][1])
-        domain = (40, 100), (5.0, domain[1][1])
+        #domain = (40, 100), (5.0, domain[1][1])
 
         for dataset_index in range(D):
 
