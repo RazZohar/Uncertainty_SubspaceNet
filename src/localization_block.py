@@ -153,34 +153,29 @@ class RayIntersection(nn.Module):
         c = (n_bkm * pos_bkm).sum(dim=-1)
 
         # ---------- weights from sigmas ----------
-        # w = 1 / sigma^2  (B, M, K) -> (B, K, M)
-        #w = 1.0 / (sigmas.clamp_min(1e-4) ** 2)
         # sigmas: [B, M, K]  (std dev in radians, predicted by network)
+        w = self.create_weight_from_uncertainty(sigmas)
 
-        min_sigma = 1e-4
-        sig = sigmas.clamp_min(min_sigma)
-
-        w_raw = 1.0 / (sig ** 2 + 1e-9)  # large sigma -> small w_raw, correct
-
-        # normalise along sensors (K) for each (B, M)
-        w_mean = w_raw.mean(dim=2, keepdim=True) + 1e-9  # [B, 1, K]
-        w = w_raw / w_mean
-        w = w.clamp(min=0.1, max=10.0)  # tune 0.1 and 10
+        print("w max:", w.max().item(), "w min:", w.min().item())
 
         w = w.permute(0, 2, 1)  # (B, K, M)
 
         # To keep the normal equations symmetric & stable,
         # we use sqrt(w) on the normals, and w on c:
-        sqrt_w = torch.sqrt(w)[..., None]  # (B, K, M, 1)
-        n_w = n_bkm * sqrt_w  # (B, K, M, 2)
-        c_w = c * w  # (B, K, M)
+        #sqrt_w = torch.sqrt(w)[..., None]  # (B, K, M, 1)
+        #n_w = n_bkm * sqrt_w  # (B, K, M, 2)
+        #c_w = c * w  # (B, K, M)
 
         # ---------- normal equations: A x = b (per batch, per source) ----------
         # A = Σ_m w_m n_m n_m^T     -> (B, K, 2, 2)
-        A = n_w.transpose(-1, -2) @ n_w
 
         # b = Σ_m w_m n_m c_m       -> (B, K, 2)
-        b = (n_w.transpose(-1, -2) @ c_w.unsqueeze(-1)).squeeze(-1)
+        # w: (B,K,M)
+        A = n_bkm.transpose(-1, -2) @ (n_bkm * w[..., None])  # (B,K,2,2)
+        b = (n_bkm.transpose(-1, -2) @ ((c * w).unsqueeze(-1))).squeeze(-1)  # (B,K,2)
+
+        det = A[..., 0, 0] * A[..., 1, 1] - A[..., 0, 1] * A[..., 1, 0]
+        print("det(abs) min/median:", det.abs().min().item(), det.abs().median().item())
 
         # regularization & solve
         I = torch.eye(2, device=device, dtype=dtype).view(1, 1, 2, 2)  # (1,1,2,2)
@@ -206,8 +201,16 @@ class RayIntersection(nn.Module):
 
         return x_hat, gdop
 
+    def create_weight_from_uncertainty(self, sigmas):
+        """
+        Weight the uncertainty into scoring for WLS.
+        Use e^(-x^2) because at zero the uncertainty is high
+        and then i want WLS to approach LS.
+        Later will use score = e^(-(sigmas^2)/tau) when tau is learnable
+        """
+        w = torch.exp(-torch.pow(sigmas, 2.0))
+        return w
 
-import torch
 
 def triangulation_with_soft_area_batched(
     sensor_positions,   # (B, 2, 2)

@@ -252,6 +252,9 @@ class SensorSourceGraphDataset(Dataset):
         self.__SAMPLE_SIZE_PER_SUBARRAY = 1
         self.__samples_model = Samples(self.__system_model_params)
 
+        self.__dataset_size = D
+        self._sensor_count = n_sensors
+
         #TODO: we limit the source to be on X axis
         source_domain = ((domain[0][0], domain[0][1]), (domain[1][0], domain[1][1]))
         #source_domain = ((domain[0][0], domain[0][1]), (0.0, 0.0))
@@ -301,7 +304,10 @@ class SensorSourceGraphDataset(Dataset):
             relative_angles = np.degrees(relative_angles) - 90.0
             # Generate I-Q signals due to the sample model
             for index in range(n_sensors):
+                distance_vector = np.linalg.norm(sensor_positions[index] - source_positions, axis=1)
 
+                # Distance decay factor is
+                self.__samples_model.apply_signal_decay(np.diag(distance_vector / np.max(distance_vector)))
                 #this is the dataset by (X, Theta) in this manner X is the signals as observed by the i'th sensor
                 subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model, samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
                                                             true_doa=relative_angles[index])
@@ -383,6 +389,10 @@ class SensorSourceGraphDataset(Dataset):
             print(f"Created path: {path}")
         torch.save(self, filename)
 
+    def create_dataset_name_from_config(self):
+        base_dataset_name = set_dataset_filename(self.__system_model_params, self.__dataset_size)
+        return f'MultiModelDataset_{self._sensor_count}' + base_dataset_name
+
     def get_sensor_potision(self):
         return self._sensor_position
 
@@ -445,6 +455,29 @@ class SensorSourceGraphDataset(Dataset):
             new_samples.append((X_stack, Y0))
 
         return new_samples
+
+
+def set_dataset_filename(system_model_params: SystemModelParams, samples_size: float):
+    """Returns the generic suffix of the datasets filename.
+
+    Args:
+    -----
+        system_model_params (SystemModelParams): an instance of SystemModelParams.
+        samples_size (float): The size of the overall dataset.
+
+    Returns:
+    --------
+        str: Suffix dataset filename
+    """
+    suffix_filename = (
+        f"_{system_model_params.signal_type}_"
+        + f"{system_model_params.signal_nature}_{samples_size}_M={system_model_params.M}_"
+        + f"N={system_model_params.N}_T={system_model_params.T}_SNR={system_model_params.snr}_"
+        + f"eta={system_model_params.eta}_sv_noise_var{system_model_params.sv_noise_var}_"
+        + f"bias={system_model_params.bias}_"
+        + ".h5"
+    )
+    return suffix_filename
 
 if __name__ == "__main__":
     pass

@@ -49,6 +49,8 @@ class Samples(SystemModel):
         """
         super().__init__(system_model_params)
 
+        self.__apply_signal_decay = False
+
     def set_doa(self, doa):
         """
         Sets the direction of arrival (DOA) for the signals.
@@ -213,7 +215,7 @@ class Samples(SystemModel):
         if self.params.signal_type == "NarrowBand":
             if self.params.signal_nature == "non-coherent":
                 # create M non-coherent signals
-                return (
+                signals = (
                     amplitude
                     * (np.sqrt(2) / 2)
                     * np.sqrt(signal_variance)
@@ -223,6 +225,10 @@ class Samples(SystemModel):
                     )
                     + signal_mean
                 )
+                if self.__apply_signal_decay:
+                    signals = self.signal_decay @ signals
+
+                return signals
 
             elif self.params.signal_nature == "coherent":
                 # Coherent signals: same amplitude and phase for all signals
@@ -295,3 +301,7 @@ class Samples(SystemModel):
 
         else:
             raise Exception(f"signal type {self.params.signal_type} is not defined")
+
+    def apply_signal_decay(self, decay_factor):
+        self.signal_decay = decay_factor
+        self.__apply_signal_decay = True

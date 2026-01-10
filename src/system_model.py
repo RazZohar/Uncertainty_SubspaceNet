@@ -228,7 +228,10 @@ class SystemModel(object):
         ...
 
         """
-        print("System Model Summery:")
+        model_rep = 'System Model Summery:'
+        #print("System Model Summery:")
         for key, value in self.__dict__.items():
-            print(key, " = ", value)
-        return "End of Model"
+            #print(key, " = ", value)
+            model_rep += f'\n{key}: {value}'
+        model_rep = model_rep + '\nEnd of Model\n'
+        return model_rep
