@@ -42,7 +42,7 @@ def create_dataset():
         d_source_source=d_source_source,
         d_sensor_source=d_sensor_source,
         domain=domain,
-        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json'
+        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_configuration.json'
     )
 
     print("Saving dataset...")
@@ -60,7 +60,7 @@ def create_dataset():
         d_source_source=d_source_source,
         d_sensor_source=d_sensor_source,
         domain=domain,
-        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_data_config.json',
+        configuration_file='/Users/razzohar/PycharmProjects/MBDL_MultiSubArrays/configuration/multi_model_configuration.json',
         sensor_positions=dataset_load._sensor_position
     )
 

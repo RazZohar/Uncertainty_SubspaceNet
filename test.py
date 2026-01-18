@@ -54,6 +54,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         if model.estimate_uncertainty is True:
                             position_metrics = position_errors(model_result["source_estimated_position"], model_result["source_estimated_position_wls"],
                                                            source_positions)
+                            print(position_metrics)
                             model_result["position_metrics"] = position_metrics
 
                     else:

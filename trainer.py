@@ -100,6 +100,14 @@ class Trainer:
         # ---------------- Model ----------------
         self.model = self._build_model().to(self.device)
 
+        # --- Log config artificat to wandb
+        configuration_artifact = wandb.Artifact(
+            name="config_json",
+            type="config",  # or "config", "results", etc.
+        )
+        configuration_artifact.add_file(self.args.config_path)
+        wandb.log_artifact(configuration_artifact)
+
         # Configure which parts of the model are trainable
         self._configure_trainable_params()
 

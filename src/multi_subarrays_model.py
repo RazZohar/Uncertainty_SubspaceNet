@@ -110,16 +110,15 @@ class MultiSubarraysModel(nn.Module):
         q_i_stack = torch.stack(q_i, dim=1)
         # TODO: Later add option to work in stages with arguments
         if self.fuse_sensors is True:
-            with torch.no_grad():
-                # TODO: add attention between subarrays
-                z_i = []
-                phi_i = []
-                for subarray_index in range(self.number_of_sensors):
-                    z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
-                    z_i.insert(subarray_index, z)
-                    phi_i.insert(subarray_index, phi)
+            z_i = []
+            phi_i = []
+            for subarray_index in range(self.number_of_sensors):
+                z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
+                z_i.insert(subarray_index, z)
+                phi_i.insert(subarray_index, phi)
 
             z_i_stack = torch.stack(z_i, dim=1)
+
         sigma_i = []
         for subarray_index in range(self.number_of_sensors):
             # if we need to fuse sensor use z_i instead of q_i

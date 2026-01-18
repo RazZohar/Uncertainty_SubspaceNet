@@ -242,15 +242,15 @@ class SensorSourceGraphDataset(Dataset):
         self.localization_scene = []
         self.use_graph_features = False  # Default to using original graphs
         with open(configuration_file, 'r') as f:
-            subarray_configuration = json.load(f)
+            subarray_configurations = json.load(f)
 
 
-        self.__system_model_params = (
+        self.__system_model_params = [(
             SystemModelParams()
-        ).set_params_from_json(subarray_configuration)
+        ).set_params_from_json(subarray_config) for subarray_config in subarray_configurations['subarray_config']]
 
         self.__SAMPLE_SIZE_PER_SUBARRAY = 1
-        self.__samples_model = Samples(self.__system_model_params)
+        self.__samples_model = [Samples(self.__system_model_params[index]) for index in range(n_sensors)]
 
         self.__dataset_size = D
         self._sensor_count = n_sensors
@@ -307,9 +307,9 @@ class SensorSourceGraphDataset(Dataset):
                 distance_vector = np.linalg.norm(sensor_positions[index] - source_positions, axis=1)
 
                 # Distance decay factor is
-                self.__samples_model.apply_signal_decay(np.diag(distance_vector / np.max(distance_vector)))
+                self.__samples_model[index].apply_signal_decay(np.diag(distance_vector / np.max(distance_vector)))
                 #this is the dataset by (X, Theta) in this manner X is the signals as observed by the i'th sensor
-                subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model, samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
+                subarray_model_dataset, subarray_generic_dataset = create_samples(model_type="MultiRSSN", phase=None, samples_model=self.__samples_model[index], samples_size=self.__SAMPLE_SIZE_PER_SUBARRAY, tau=None,
                                                             true_doa=relative_angles[index])
 
                 # Convert to tensor during data generation

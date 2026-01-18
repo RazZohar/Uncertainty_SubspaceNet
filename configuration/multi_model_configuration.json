@@ -20,7 +20,7 @@
         "N": 8,
         "M": 3,
         "T": 100,
-        "snr": 10,
+        "snr": 3,
         "signal_type": "NarrowBand",
         "signal_nature": "non-coherent",
         "eta": 0.0,
@@ -37,7 +37,7 @@
         "snr": 10,
         "signal_type": "NarrowBand",
         "signal_nature": "non-coherent",
-        "eta": 0.0,
+        "eta": 0.03,
         "bias": 0.0,
         "sv_noise_var": 0.0,
         "codebook_size": 128
