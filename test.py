@@ -48,6 +48,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     #doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
                     doa_pred = model_result["bearings"]
                     sigma_pred = model_result["sigma_i"]
+                    print(f'sigma_pred: {sigma_pred}')
 
                     if model.estimate_position is True:
                         pos_pred = model_result["source_estimated_position"]
@@ -70,7 +71,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                             bearings=doa_pred[sample_index],  # (M,)
                             x_hat=pos_pred[sample_index],  # (2,)
                             x_true=source_positions[sample_index],  # (2,)
-                            sigmas=sigma_pred[sample_index],
+                            sigmas=torch.deg2rad(sigma_pred[sample_index]),
                             #sigmas=torch.zeros_like(doa_pred[sample_index]),
                             step=step,
                             save_path=f"visualizations/sample_{sample_index:03d}_test_{step:03d}.png"

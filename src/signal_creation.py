@@ -226,7 +226,8 @@ class Samples(SystemModel):
                     + signal_mean
                 )
                 if self.__apply_signal_decay:
-                    signals = self.signal_decay @ signals
+                    #signals = self.signal_decay @ signals
+                    pass
 
                 return signals
 

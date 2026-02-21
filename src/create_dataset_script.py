@@ -20,7 +20,7 @@ def create_dataset():
     # Parameters
     domain = ((0, 100), (0, 100))  # (x range, y range)
     n_sensors = 3
-    n_sources = 3
+    n_sources = 2
     d_sensor_sensor = 1.0
     d_source_source = 6.0
     d_sensor_source = 3.5

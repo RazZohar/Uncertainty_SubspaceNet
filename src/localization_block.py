@@ -208,6 +208,9 @@ class RayIntersection(nn.Module):
         and then i want WLS to approach LS.
         Later will use score = e^(-(sigmas^2)/tau) when tau is learnable
         """
+        TEMPERATURE_TAU_UNCERTAINTY = 5.0
+        #tau = (torch.deg2rad(torch.tensor(TEMPERATURE_TAU_UNCERTAINTY, device=sigmas.device))**2)
+        #w = torch.exp(-torch.pow(sigmas, 2.0) / tau)
         w = torch.exp(-torch.pow(sigmas, 2.0))
         return w
 

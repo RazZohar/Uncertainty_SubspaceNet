@@ -4,7 +4,7 @@
     {
       "system_model": {
         "N": 8,
-        "M": 3,
+        "M": 2,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",
@@ -18,7 +18,7 @@
     {
       "system_model": {
         "N": 8,
-        "M": 3,
+        "M": 2,
         "T": 100,
         "snr": 3,
         "signal_type": "NarrowBand",
@@ -32,9 +32,9 @@
     {
       "system_model": {
         "N": 8,
-        "M": 3,
+        "M": 2,
         "T": 100,
-        "snr": 10,
+        "snr": 3,
         "signal_type": "NarrowBand",
         "signal_nature": "non-coherent",
         "eta": 0.03,

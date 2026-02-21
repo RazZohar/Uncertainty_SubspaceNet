@@ -65,7 +65,7 @@ class MultiSubarraysModel(nn.Module):
             # Add the learned attentaion layer
             self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
 
-            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(self.number_of_sensors))
+            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(subarray_configuration[subarray_index]['system_model']['T']))
 
 
     def _create_subarray_model_by_configuration(self, subarray_configuration):
@@ -131,7 +131,7 @@ class MultiSubarraysModel(nn.Module):
             bearings.append(doa_pred)
             if self.estimate_uncertainty is True:
                 with torch.no_grad():
-                    sigma = self.uncertainty_pred[subarray_index].forward((doa_pred + (torch.pi/2)).rad2deg(), R)
+                    sigma = self.uncertainty_pred[subarray_index].forward((doa_pred).rad2deg(), R)
                     sigma_i.insert(subarray_index, sigma)
 
 
@@ -151,7 +151,7 @@ class MultiSubarraysModel(nn.Module):
             if self.estimate_position is True:
                 source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
                 if self.estimate_uncertainty is True:
-                    source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack.sqrt()))
+                    source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack))
 
                 #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
 
@@ -164,7 +164,7 @@ class MultiSubarraysModel(nn.Module):
                 requested_values["phi_i"] = phi_i
 
             if self.estimate_uncertainty is True:
-                requested_values["sigma_i"] = torch.deg2rad(sigma_i_stack.sqrt())
+                requested_values["sigma_i"] = sigma_i_stack
 
 
 
