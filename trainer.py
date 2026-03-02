@@ -245,7 +245,7 @@ class Trainer:
                     #doa_pred = doa_pred.squeeze(dim=-1)
                     #loss = self.criterion(doa_pred, doa_gt)
                     for i in range(doa_gt.shape[1]):
-                        loss += self.criterion(doa_pred[:, i, :], doa_gt.unsqueeze(-1)[:, i, :])
+                        loss += self.criterion(doa_pred[:, i, :], doa_gt[:, i, :])
                 else:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
                     loss = self.criterion(pos_pred, source_positions.squeeze(-2))

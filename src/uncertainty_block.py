@@ -67,15 +67,18 @@ def esprit_overlapped(Rhat: np.ndarray, d_sources: int, shift: int = 1):
     """
     M = Rhat.shape[0]
     evals, evecs = np.linalg.eigh(Rhat)
-    idx = np.argsort(evals)[::-1][:d_sources].copy()
+    idx = np.argsort(evals)[-d_sources:].copy()
     E_s = evecs[:, idx]
     J1, J2 = build_overlapped_selectors(M, shift=shift)
     E_x, E_y = J1 @ E_s, J2 @ E_s
     F = np.linalg.pinv(E_x) @ E_y
-    lam, V = np.linalg.eig(F)      # right eigvecs (columns)
-    Q = np.linalg.inv(V)           # left eigvecs (rows)
-    return {"E_s": E_s, "E_x": E_x, "E_y": E_y, "J1": J1, "J2": J2, "F": F,
-            "lambda": lam, "V": V, "Q": Q}
+    lam, V = np.linalg.eig(F)
+    Q = np.linalg.inv(V)
+    return {
+        "E_s": E_s, "E_x": E_x, "E_y": E_y, "J1": J1, "J2": J2, "F": F,
+        "lambda": lam, "V": V, "Q": Q,
+        "evals": evals, "evecs": evecs, "sig_idx": idx
+    }
 
 # ================== 4th‑order moment (Eq. 63, Gaussian) ==================
 
@@ -119,16 +122,16 @@ def compute_delta_s_covariance_blocks_eq66(
                 for n in range(M):
                     if n == h:
                         continue
-                        s_n = S_full[:, n]; s_n_conj = s_n.conj()
-                        T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))  # (b1,b2)
-                        T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))  # (b2,b1)
-                        T3_H = np.tensordot(s_n_conj, T2_H, axes=(0, 0))  # (b2)
-                        T3_T = np.tensordot(s_n_conj, T2_T, axes=(0, 1))  # (b2)
-                        coeff_H = np.dot(s_h, T3_H)
-                        coeff_T = np.dot(s_h, T3_T)
-                        denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n]) + denom_eps
-                        accum_H += (coeff_H / denom) * (s_i[:, None] @ s_n_conj[None, :])
-                        accum_T += (coeff_T / denom) * (s_i[:, None] @ s_n[None, :])
+                    s_n = S_full[:, n]; s_n_conj = s_n.conj()
+                    T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))  # (b1,b2)
+                    T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))  # (b2,b1)
+                    T3_H = np.tensordot(s_n_conj, T2_H, axes=(0, 0))  # (b2)
+                    T3_T = np.tensordot(s_n_conj, T2_T, axes=(0, 1))  # (b2)
+                    coeff_H = np.vdot(s_h, T3_H)
+                    coeff_T = np.vdot(s_h, T3_T)
+                    denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n]) + denom_eps
+                    accum_H += (coeff_H / denom) * (s_i[:, None] @ s_n_conj[None, :])
+                    accum_T += (coeff_T / denom) * (s_i[:, None] @ s_n[None, :])
 
             # Hermitian symmetrize the ^H block
             accum_H = (accum_H + accum_H.conj().T) / 2
@@ -176,13 +179,32 @@ def eq58_scale_half_lambda(theta_i: float, eps: float = 1e-8) -> float:
 
 def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
                                             clip_nonneg: bool = True, eps: float = 1e-8) -> float:
+    """
     scale = eq58_scale_half_lambda(theta_i, eps)
 
-    mag = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i)**2))
+    #mag = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i)**2))
+    mag = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
 
     #print(f'{scale=}, {mag=}, {eq52_val=}, {eq53_val=},  ')
     val = scale * mag
     return float(max(val, 0.0)) if clip_nonneg else float(val)
+    """
+    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
+    var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
+
+    # Yuen 96 Equation 58 scales the lambda variance by 1/2
+    var_lambda = 0.5 * var_lambda
+
+    # Safe clipping
+    if clip_nonneg and var_lambda < 0:
+        var_lambda = 1e-12
+
+    # Derivative mapped to Yuen's domain (theta_rad now represents [0, pi])
+    derivative_sq = (np.pi * np.sin(theta_i)) ** 2
+    if derivative_sq < 1e-12:
+        derivative_sq = 1e-12
+
+    return var_lambda / derivative_sq
 
 # ===================== Data generation (multi‑source) =====================
 
@@ -211,7 +233,7 @@ def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
     plt.show()
 
 
-
+from scipy.optimize import linear_sum_assignment
 
 class UncertaintyEstimation(nn.Module):
     def __init__(self, signal_shape):
@@ -224,27 +246,28 @@ class UncertaintyEstimation(nn.Module):
         s = np.clip(np.angle(lam) / np.pi, -1.0, 1.0)
         return np.rad2deg(-np.arcsin(s))
 
-    def match_perm_to_external(self, doa_ext_deg, lam):
+    def match_perm_to_external(self, doas_deg, lam):
         """
-        Returns perm_ext_to_int: array of length K.
-        perm_ext_to_int[k] = i  means external DOA k corresponds to internal eigen-pair i.
+        Matches unordered ESPRIT roots (lam) to the Neural Network's ordered angles (doas_deg)
+        by measuring distance directly on the Complex Unit Circle.
         """
-        doa_int = self.doa_from_lam_deg(lam)
-        K = len(doa_ext_deg)
+        doas_deg = np.asarray(doas_deg)
 
-        best_perm = None
-        best_cost = np.inf
+        # 1. Convert the Network's physical angles into theoretical ESPRIT roots.
+        # We use your system model's exact phase mapping: e^{-j * pi * sin(theta)}
+        expected_lam = np.exp(-1j * np.pi * np.sin(np.deg2rad(doas_deg)))
 
-        for perm in itertools.permutations(range(K)):
-            # perm maps external index k -> internal index perm[k]
-            cost = 0.0
-            for k in range(K):
-                cost += abs(doa_int[perm[k]] - doa_ext_deg[k])
-            if cost < best_cost:
-                best_cost = cost
-                best_perm = perm
+        # 2. Normalize the actual ESPRIT roots to ensure they sit perfectly on the unit circle
+        actual_lam = lam / np.abs(lam)
 
-        return np.array(best_perm), doa_int
+        # 3. Create a cost matrix based on Complex Euclidean Distance
+        # This bypasses all arcsin coordinate ambiguities!
+        cost_matrix = np.abs(expected_lam[:, None] - actual_lam[None, :])
+
+        # 4. Hungarian algorithm to find the optimal 1-to-1 match
+        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+        return col_ind, cost_matrix[row_ind, col_ind]
 
     def compute_predicated_uncertainty(self, doas_deg, Rx):
         """
@@ -264,8 +287,10 @@ class UncertaintyEstimation(nn.Module):
         """
 
         # 2) covariance (NO FB), optional shrinkage
-        Rhat = Rx
+        Rhat = Rx.detach().cpu().numpy()
         doas_deg = doas_deg.detach().cpu().numpy()
+
+        Rhat = 0.5 * (Rhat + np.conj(Rhat).T)
 
         dsrc = len(doas_deg)
 
@@ -274,7 +299,7 @@ class UncertaintyEstimation(nn.Module):
         pred_hat_deg2_all = []  # list of (K,) predicted var using θ̂ in scale
 
         # 3) ESPRIT (overlapped, shift=1), use λ "as is"
-        esp = esprit_overlapped(Rhat.detach().cpu().numpy(), d_sources=dsrc, shift=1)
+        esp = esprit_overlapped(Rhat, d_sources=dsrc, shift=1)
         J1, J2, E_x = esp["J1"], esp["J2"], esp["E_x"]
         lam, V, Q = esp["lambda"], esp["V"], esp["Q"]
 
@@ -285,8 +310,10 @@ class UncertaintyEstimation(nn.Module):
 
         # 4) 4th‑order tensor (Gaussian plug‑in) and Eq.66 blocks
         Rcov_conj = rcov_conj_gaussian_plugin(Rhat, Ns=self.__signal_shape)
-        alpha_hat, S_hat = np.linalg.eigh(Rhat)
-        sig_idx = np.argsort(alpha_hat)[-dsrc:]
+        alpha_hat = esp["evals"]
+        S_hat = esp["evecs"]
+        sig_idx = esp["sig_idx"]
+
         covHs_gh, covTs_gh = compute_delta_s_covariance_blocks_eq66(
             S_hat, alpha_hat, Rcov_conj, sig_idx, denom_eps=1e-6
         )
@@ -296,30 +323,44 @@ class UncertaintyEstimation(nn.Module):
         V_ext = V[:, perm_ext_to_int]
         Q_ext = Q[perm_ext_to_int, :]
 
-        #print("external doa:", theta_hat_deg)
-        #print("internal doa :", doa_int)
-        #print("matched doa  :", doa_int[perm_ext_to_int])
+        print("external doa:", theta_hat_deg)
+        print("internal doa :", doa_int)
+        print("matched doa  :", doa_int[perm_ext_to_int])
 
+        matced_doas = doa_int[perm_ext_to_int]
 
         # 5) per‑mode Eq.52/53/58 (index‑aligned: i->i)
         pred_hat_deg2 = np.zeros(dsrc)
         for i in range(dsrc):
-            v_i = V_ext[:, i][:, None]
-            q_i = Q_ext[i, :][None, :]
-            lam_i = lam_ext[i]
+            v_i = V[:, i][:, None]
+            q_i = Q[i, :][None, :]
+            lam_i = lam[i]
 
-            alpha = (q_i @ v_i).item()
-            q_i = q_i / alpha
+            v_e = V_ext[:, i][:, None]
+            q_e = Q_ext[i, :][None, :]
+            lam_e = lam_ext[i]
+
+            #alpha = (q_i @ v_i).item()
+            #q_i = q_i / alpha
 
             eq52_i = compute_eq52_weighted(lam_i, q_i, E_x, J1, J2, covHs_gh, v_i)
             eq53_i = compute_eq53_weighted(lam_i, q_i, E_x, J1, J2, covTs_gh, v_i)
 
 
-            var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_i, eq53_i, np.deg2rad(theta_hat_deg[i]),
+            var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_i, eq53_i, np.deg2rad(theta_hat_deg[i] + 90.0),
                                                               clip_nonneg=True)
 
-            #print(f'when Using lam_u {var_hat_u=} {lam_u=} {eq52_u=} {eq53_u=}, ')
-            #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
+
+
+            eq52_e = compute_eq52_weighted(lam_e, q_e, E_x, J1, J2, covHs_gh, v_e)
+            eq53_e = compute_eq53_weighted(lam_e, q_e, E_x, J1, J2, covTs_gh, v_e)
+
+            ext_var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_e, eq52_e, eq53_e, np.deg2rad(theta_hat_deg[i] + 90.0),
+                                                              clip_nonneg=True)
+
+
+            print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, ')
+            print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
 
 
             pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
