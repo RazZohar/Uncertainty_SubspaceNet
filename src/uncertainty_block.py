@@ -45,6 +45,7 @@ plot_spectrum_flag = True
 import math
 import numpy as np
 import torch
+import scipy
 from typing import Optional
 
 
@@ -72,8 +73,7 @@ def esprit_overlapped(Rhat: np.ndarray, d_sources: int, shift: int = 1):
     J1, J2 = build_overlapped_selectors(M, shift=shift)
     E_x, E_y = J1 @ E_s, J2 @ E_s
     F = np.linalg.pinv(E_x) @ E_y
-    lam, V = np.linalg.eig(F)
-    Q = np.linalg.inv(V)
+    lam, Q, V = scipy.linalg.eig(F, left=True, right=True)
     return {
         "E_s": E_s, "E_x": E_x, "E_y": E_y, "J1": J1, "J2": J2, "F": F,
         "lambda": lam, "V": V, "Q": Q,
@@ -106,6 +106,9 @@ def compute_delta_s_covariance_blocks_eq66(
     covHs_gh = np.zeros((d, d, M, M), dtype=complex)
     covTs_gh = np.zeros((d, d, M, M), dtype=complex)
 
+    sig_idx = np.asarray(signal_indices)
+    noise_idx = np.setdiff1d(np.arange(M), sig_idx)
+
     for gi, g in enumerate(sig_idx):
         s_g = S_full[:, g]
         for hi, h in enumerate(sig_idx):
@@ -113,23 +116,28 @@ def compute_delta_s_covariance_blocks_eq66(
             accum_H = np.zeros((M, M), dtype=complex)
             accum_T = np.zeros((M, M), dtype=complex)
 
-            for i in range(M):
-                if i == g:
-                    continue
-                s_i = S_full[:, i]; s_i_conj = s_i.conj()
-                T1_H = np.tensordot(s_i_conj, Rcov_conj,   axes=(0, 0))  # (a2,b1,b2)
-                T1_T = np.tensordot(s_i_conj, Rcov_unconj, axes=(0, 0))  # (a2,b2,b1)
-                for n in range(M):
-                    if n == h:
-                        continue
-                    s_n = S_full[:, n]; s_n_conj = s_n.conj()
-                    T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))  # (b1,b2)
-                    T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))  # (b2,b1)
-                    T3_H = np.tensordot(s_n_conj, T2_H, axes=(0, 0))  # (b2)
-                    T3_T = np.tensordot(s_n_conj, T2_T, axes=(0, 1))  # (b2)
+            for i in noise_idx:
+                s_i = S_full[:, i]
+                s_i_conj = s_i.conj()
+                T1_H = np.tensordot(s_i_conj, Rcov_conj, axes=(0, 0))
+                T1_T = np.tensordot(s_i_conj, Rcov_unconj, axes=(0, 0))
+
+                for n in noise_idx:
+                    s_n = S_full[:, n]
+                    s_n_conj = s_n.conj()
+
+                    T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))
+                    T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))
+                    T3_H = np.tensordot(s_n_conj, T2_H, axes=(0, 0))
+                    T3_T = np.tensordot(s_n_conj, T2_T, axes=(0, 1))
+
                     coeff_H = np.vdot(s_h, T3_H)
-                    coeff_T = np.vdot(s_h, T3_T)
-                    denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n]) + denom_eps
+                    coeff_T = np.dot(s_h, T3_T)  # see note below
+
+                    denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n])
+                    if abs(denom) < denom_eps:
+                        denom += denom_eps
+
                     accum_H += (coeff_H / denom) * (s_i[:, None] @ s_n_conj[None, :])
                     accum_T += (coeff_T / denom) * (s_i[:, None] @ s_n[None, :])
 
@@ -189,8 +197,8 @@ def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
     val = scale * mag
     return float(max(val, 0.0)) if clip_nonneg else float(val)
     """
-    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
-    var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
+    var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
+    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
 
     # Yuen 96 Equation 58 scales the lambda variance by 1/2
     var_lambda = 0.5 * var_lambda
@@ -318,10 +326,21 @@ class UncertaintyEstimation(nn.Module):
             S_hat, alpha_hat, Rcov_conj, sig_idx, denom_eps=1e-6
         )
 
-        perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam)
-        lam_ext = lam[perm_ext_to_int]
+        for g in range(dsrc):
+            covHs_gh[g, g] = 0.5 * (covHs_gh[g, g] + covHs_gh[g, g].conj().T)
+
+        for g in range(dsrc):
+            for h in range(g + 1, dsrc):
+                A = 0.5 * (covHs_gh[g, h] + covHs_gh[h, g].conj().T)
+                covHs_gh[g, h] = A
+                covHs_gh[h, g] = A.conj().T
+
+        lam_u = lam / np.maximum(np.abs(lam), 1e-12)
+
+        perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam_u)
+        lam_ext = lam_u[perm_ext_to_int]
         V_ext = V[:, perm_ext_to_int]
-        Q_ext = Q[perm_ext_to_int, :]
+        Q_ext = Q[:, perm_ext_to_int]
 
         print("external doa:", theta_hat_deg)
         print("internal doa :", doa_int)
@@ -333,15 +352,14 @@ class UncertaintyEstimation(nn.Module):
         pred_hat_deg2 = np.zeros(dsrc)
         for i in range(dsrc):
             v_i = V[:, i][:, None]
-            q_i = Q[i, :][None, :]
-            lam_i = lam[i]
+            q_i = Q[:, i].conj()[None, :]
+            q_i = q_i / (q_i @ v_i)
+            lam_i = lam_u[i]
 
             v_e = V_ext[:, i][:, None]
-            q_e = Q_ext[i, :][None, :]
+            q_e = Q_ext[:, i].conj()[None, :]
+            q_e = q_e / (q_e @ v_e)
             lam_e = lam_ext[i]
-
-            #alpha = (q_i @ v_i).item()
-            #q_i = q_i / alpha
 
             eq52_i = compute_eq52_weighted(lam_i, q_i, E_x, J1, J2, covHs_gh, v_i)
             eq53_i = compute_eq53_weighted(lam_i, q_i, E_x, J1, J2, covTs_gh, v_i)
@@ -359,11 +377,11 @@ class UncertaintyEstimation(nn.Module):
                                                               clip_nonneg=True)
 
 
-            print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, ')
-            print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
+            print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
+            print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
 
 
-            pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
+            pred_hat_deg2[i] = ext_var_hat * ((180 / np.pi) ** 2)
             #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
 
         theta_hat_all.append(theta_hat_deg)
