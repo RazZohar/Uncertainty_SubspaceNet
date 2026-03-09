@@ -83,7 +83,11 @@ def esprit_overlapped(Rhat: np.ndarray, d_sources: int, shift: int = 1):
 # ================== 4th‑order moment (Eq. 63, Gaussian) ==================
 
 def rcov_conj_gaussian_plugin(Rhat: np.ndarray, Ns: int) -> np.ndarray:
-    return (Rhat[:, None, :, None] * Rhat[None, :, None, :]) / Ns
+    #return (Rhat[:, None, :, None] * Rhat[None, :, None, :]) / Ns
+
+    term1 = Rhat[:, None, :, None] * np.conj(Rhat)[None, :, None, :]
+    term2 = Rhat[:, None, None, :] * np.conj(Rhat)[None, :, :, None]
+    return (term1 + term2) / Ns
 
 # =============== Eq. 66: eigenvector perturbation blocks ===============
 
@@ -136,7 +140,8 @@ def compute_delta_s_covariance_blocks_eq66(
 
                     denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n])
                     if abs(denom) < denom_eps:
-                        denom += denom_eps
+                        #denom += denom_eps
+                        continue
 
                     accum_H += (coeff_H / denom) * (s_i[:, None] @ s_n_conj[None, :])
                     accum_T += (coeff_T / denom) * (s_i[:, None] @ s_n[None, :])
@@ -196,9 +201,9 @@ def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
     #print(f'{scale=}, {mag=}, {eq52_val=}, {eq53_val=},  ')
     val = scale * mag
     return float(max(val, 0.0)) if clip_nonneg else float(val)
-    """
-    var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
-    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
+
+    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
+    var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
 
     # Yuen 96 Equation 58 scales the lambda variance by 1/2
     var_lambda = 0.5 * var_lambda
@@ -213,6 +218,23 @@ def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
         derivative_sq = 1e-12
 
     return var_lambda / derivative_sq
+    """
+
+    scale = eq58_scale_half_lambda(theta_i, eps)
+
+    # Calculate the true magnitude squared of the empirical eigenvalue
+    mag_sq = np.abs(lam_i) ** 2
+
+    # Correct normalizations derived from Var(Im(d_lambda / lambda))
+    term1 = np.real(eq52_val)# / mag_sq
+
+    # eq53_val / lam_i^2 is mathematically equivalent to (eq53_val * (lam_i^*)^2) / |lam_i|^4
+    term2 = np.real(eq53_val * (np.conj(lam_i) ** 2))# / (mag_sq ** 2)
+
+    var_lambda = term1 - term2
+
+    val = scale * var_lambda
+    return float(max(val, 0.0)) if clip_nonneg else float(val)
 
 # ===================== Data generation (multi‑source) =====================
 
@@ -335,53 +357,59 @@ class UncertaintyEstimation(nn.Module):
                 covHs_gh[g, h] = A
                 covHs_gh[h, g] = A.conj().T
 
-        lam_u = lam / np.maximum(np.abs(lam), 1e-12)
-
-        perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam_u)
-        lam_ext = lam_u[perm_ext_to_int]
+        #lam_u = lam / np.maximum(np.abs(lam), 1e-12)
+        lam = lam / np.abs(lam)
+        perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam)
+        lam_ext = lam[perm_ext_to_int]
         V_ext = V[:, perm_ext_to_int]
         Q_ext = Q[:, perm_ext_to_int]
 
         print("external doa:", theta_hat_deg)
-        print("internal doa :", doa_int)
-        print("matched doa  :", doa_int[perm_ext_to_int])
+        #print("internal doa :", doa_int)
+        print("matched doa  :", self.doa_from_lam_deg(lam_ext))
 
-        matced_doas = doa_int[perm_ext_to_int]
+        matced_doas =  self.doa_from_lam_deg(lam_ext)
 
         # 5) per‑mode Eq.52/53/58 (index‑aligned: i->i)
         pred_hat_deg2 = np.zeros(dsrc)
         for i in range(dsrc):
+            """
             v_i = V[:, i][:, None]
             q_i = Q[:, i].conj()[None, :]
             q_i = q_i / (q_i @ v_i)
-            lam_i = lam_u[i]
+            lam_i = lam[i]
+            """
+            v_i = V_ext[:, i][:, None]
+            q_i = Q_ext[:, i].conj()[None, :]
+            q_i = q_i / (q_i @ v_i)
+            lam_i = lam_ext[i]
 
-            v_e = V_ext[:, i][:, None]
-            q_e = Q_ext[:, i].conj()[None, :]
-            q_e = q_e / (q_e @ v_e)
-            lam_e = lam_ext[i]
+            #v_e = V_ext[:, i][:, None]
+            #q_e = Q_ext[:, i].conj()[None, :]
+            #q_e = q_e / (q_e @ v_e)
+            #lam_e = lam_ext[i]
 
             eq52_i = compute_eq52_weighted(lam_i, q_i, E_x, J1, J2, covHs_gh, v_i)
             eq53_i = compute_eq53_weighted(lam_i, q_i, E_x, J1, J2, covTs_gh, v_i)
 
 
-            var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_i, eq53_i, np.deg2rad(theta_hat_deg[i] + 90.0),
+            var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_i, eq53_i, np.deg2rad(theta_hat_deg[i]),
                                                               clip_nonneg=True)
 
 
 
-            eq52_e = compute_eq52_weighted(lam_e, q_e, E_x, J1, J2, covHs_gh, v_e)
-            eq53_e = compute_eq53_weighted(lam_e, q_e, E_x, J1, J2, covTs_gh, v_e)
+            #eq52_e = compute_eq52_weighted(lam_e, q_e, E_x, J1, J2, covHs_gh, v_e)
+            #eq53_e = compute_eq53_weighted(lam_e, q_e, E_x, J1, J2, covTs_gh, v_e)
 
-            ext_var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_e, eq52_e, eq53_e, np.deg2rad(theta_hat_deg[i] + 90.0),
-                                                              clip_nonneg=True)
+            #ext_var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_e, eq52_e, eq53_e, np.deg2rad(theta_hat_deg[i]),
+            #                                                  clip_nonneg=True)
 
 
-            print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
+            #print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
             print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
 
 
-            pred_hat_deg2[i] = ext_var_hat * ((180 / np.pi) ** 2)
+            pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
             #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
 
         theta_hat_all.append(theta_hat_deg)
