@@ -96,58 +96,75 @@ def compute_delta_s_covariance_blocks_eq66(
     alpha: np.ndarray,
     Rcov_conj: np.ndarray,
     signal_indices,
-    denom_eps: float = 1e-6
+    denom_eps: float = 1e-12,
+    use_full_sums: bool = True,   # True = literal Eq. (62)/(66)
 ):
     """
-    Returns covHs_gh, covTs_gh of shape (d, d, M, M), using the "swap" note for the
-    unconjugated 4th moment and small denominator regularization denom_eps.
+    Returns covHs_gh, covTs_gh of shape (d, d, M, M).
+
+    If use_full_sums=False:
+        sums only over noise eigenvectors (common reduced form in subspace perturbation use).
+    If use_full_sums=True:
+        uses the literal paper sums l != g and n != h.
     """
-    S_full = np.asarray(S_full); alpha = np.asarray(alpha); Rcov_conj = np.asarray(Rcov_conj)
+    S_full = np.asarray(S_full)
+    alpha = np.asarray(alpha)
+    Rcov_conj = np.asarray(Rcov_conj)
+
     M = S_full.shape[0]
-    sig_idx = np.asarray(signal_indices); d = sig_idx.size
+    sig_idx = np.asarray(signal_indices)
+    d = sig_idx.size
+
+    # Eq. (66) note: E{ΔR[a1,a2] ΔR[b1,b2]} = E{ΔR[a1,a2] ΔR*[b2,b1]}
     Rcov_unconj = np.swapaxes(Rcov_conj, 2, 3)
 
     covHs_gh = np.zeros((d, d, M, M), dtype=complex)
     covTs_gh = np.zeros((d, d, M, M), dtype=complex)
 
-    sig_idx = np.asarray(signal_indices)
     noise_idx = np.setdiff1d(np.arange(M), sig_idx)
 
     for gi, g in enumerate(sig_idx):
         s_g = S_full[:, g]
+
+        l_indices = np.setdiff1d(np.arange(M), [g]) if use_full_sums else noise_idx
+
         for hi, h in enumerate(sig_idx):
             s_h = S_full[:, h]
+
+            n_indices = np.setdiff1d(np.arange(M), [h]) if use_full_sums else noise_idx
+
             accum_H = np.zeros((M, M), dtype=complex)
             accum_T = np.zeros((M, M), dtype=complex)
 
-            for i in noise_idx:
-                s_i = S_full[:, i]
-                s_i_conj = s_i.conj()
-                T1_H = np.tensordot(s_i_conj, Rcov_conj, axes=(0, 0))
-                T1_T = np.tensordot(s_i_conj, Rcov_unconj, axes=(0, 0))
+            for l in l_indices:
+                s_l = S_full[:, l]
 
-                for n in noise_idx:
+                # common first two contractions: s_l^* , s_g
+                T1_H = np.tensordot(s_l.conj(), Rcov_conj, axes=(0, 0))   # [a2,b1,b2]
+                T1_T = np.tensordot(s_l.conj(), Rcov_unconj, axes=(0, 0)) # [a2,b1,b2]
+
+                T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))               # [b1,b2]
+                T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))               # [b1,b2]
+
+                for n in n_indices:
                     s_n = S_full[:, n]
-                    s_n_conj = s_n.conj()
 
-                    T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))
-                    T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))
-                    T3_H = np.tensordot(s_n_conj, T2_H, axes=(0, 0))
-                    T3_T = np.tensordot(s_n_conj, T2_T, axes=(0, 1))
+                    # Eq. (62): ... s_{n,b1} s^*_{h,b2}
+                    T3_H = np.tensordot(s_n, T2_H, axes=(0, 0))           # [b2]
+                    coeff_H = np.vdot(s_h, T3_H)                          # sum_b2 s_h^*[b2] * T3_H[b2]
 
-                    coeff_H = np.vdot(s_h, T3_H)
-                    coeff_T = np.dot(s_h, T3_T)  # see note below
+                    # Eq. (66): ... s^*_{n,b1} s_{h,b2}
+                    T3_T = np.tensordot(s_n.conj(), T2_T, axes=(0, 0))    # [b2]
+                    coeff_T = np.dot(T3_T, s_h)                           # no conjugation on s_h
 
-                    denom = (alpha[g] - alpha[i]) * (alpha[h] - alpha[n])
+                    denom = (alpha[g] - alpha[l]) * (alpha[h] - alpha[n])
+
                     if abs(denom) < denom_eps:
-                        #denom += denom_eps
                         continue
 
-                    accum_H += (coeff_H / denom) * (s_i[:, None] @ s_n_conj[None, :])
-                    accum_T += (coeff_T / denom) * (s_i[:, None] @ s_n[None, :])
+                    accum_H += (coeff_H / denom) * np.outer(s_l, s_n.conj())  # s_l s_n^H
+                    accum_T += (coeff_T / denom) * np.outer(s_l, s_n)         # s_l s_n^T
 
-            # Hermitian symmetrize the ^H block
-            accum_H = (accum_H + accum_H.conj().T) / 2
             covHs_gh[gi, hi] = accum_H
             covTs_gh[gi, hi] = accum_T
 
@@ -171,9 +188,32 @@ def _assemble_middle_from_v(v_i: np.ndarray, cov_gh: np.ndarray, conjugate_h: bo
     W = np.outer(v, np.conj(v)) if conjugate_h else np.outer(v, v)
     return np.tensordot(W, cov, axes=([0, 1], [0, 1]))  # (M x M)
 
+def enforce_psd_onto_matrix(matrix):
+    """
+    I use Hermittian and then Diagonal Loading
+    :param matrix:
+    :return: PSD matrix from the given input matrix
+    """
+    #M = (matrix + matrix.conj().T) / 2
+    M = matrix
+    eigenvalues = np.linalg.eigvals(M)
+    min_eig = np.min(eigenvalues)
+
+    # 3. Calculate the required shift
+    epsilon = 1e-6
+    shift = max(0, -min_eig) + epsilon
+
+    # 4. Apply diagonal loading
+    M_psd = M + shift * np.eye(M.shape[0])
+
+    return M_psd
+
 def compute_eq52_weighted(lam_i, q_i, E_x, W1, W2, covHs_gh, v_i):
     E_x_pinv = np.linalg.pinv(E_x)
     middle = _assemble_middle_from_v(v_i, covHs_gh, conjugate_h=True)
+
+    if np.min(np.linalg.eigvals(middle)) < 0:
+        print(f'52 middle {np.linalg.eigvals(middle)=} result non PSD matrix')
     left   = q_i @ E_x_pinv @ (W1 - np.conj(lam_i) * W2)                 # (1 x M)
     right  = (W1 - np.conj(lam_i) * W2).conj().T @ E_x_pinv.conj().T @ q_i.conj().T  # (M x 1)
     return (left @ middle @ right).item()
@@ -181,13 +221,18 @@ def compute_eq52_weighted(lam_i, q_i, E_x, W1, W2, covHs_gh, v_i):
 def compute_eq53_weighted(lam_i, q_i, E_x, W1, W2, covTs_gh, v_i):
     E_x_pinv = np.linalg.pinv(E_x)
     middle = _assemble_middle_from_v(v_i, covTs_gh, conjugate_h=False)
+    """if np.min(np.linalg.eigvals(middle)) < 0:
+        print(f'53 middle {np.linalg.eigvals(middle)=} result non PSD matrix')
+        middle = enforce_psd_onto_matrix(middle)
+        print(f'{np.linalg.eigvals(middle)=} , {np.min(np.linalg.eigvals(middle))=}')
+    """
     left   = q_i @ E_x_pinv @ (W2 - lam_i * W1)
     right  = (W2 - lam_i * W1).T @ E_x_pinv.T @ q_i.T
     return (left @ middle @ right).item()
 # ================= Eq. 58 with Δ = λ/2 simplified =================
 
 def eq58_scale_half_lambda(theta_i: float, eps: float = 1e-8) -> float:
-    c2 = max(np.cos(theta_i)**2, eps)  # guard endfire
+    c2 = max(np.cos(theta_i + np.pi/2)**2, eps)  # guard endfire
     return 1.0 / (2 * np.pi**2 * c2)
 
 def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
@@ -243,25 +288,63 @@ import numpy as np
 import matplotlib.pyplot as plt
 import itertools
 
+import numpy as np
+import matplotlib.pyplot as plt
+import math
+
 def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
     """
-    Scatter plot of sigma_pred against doa_pred.
+    Plot sigma_pred against doa_pred with one polar subplot per target.
 
-    doa_pred, sigma_pred: array-like (numpy / torch / list), same shape when flattened.
+    Expected shape:
+        doa_pred   : [Batch, num_targets]
+        sigma_pred : [Batch, num_targets]
     """
-    doa = np.asarray(doa_pred, dtype=float).ravel()
-    sig = np.asarray(sigma_pred, dtype=float).ravel()
+    doa = np.asarray(doa_pred, dtype=float)
+    sig = np.asarray(sigma_pred, dtype=float)
 
     if doa.shape != sig.shape:
-        raise ValueError(f"Shape mismatch after flatten: doa={doa.shape}, sigma={sig.shape}")
+        raise ValueError(f"Shape mismatch: doa={doa.shape}, sigma={sig.shape}")
 
-    plt.figure()
-    plt.scatter(doa, sig)
-    plt.xlabel("doa_pred [deg]")
-    plt.ylabel("sigma_pred [deg]")
-    plt.title(title)
+    if doa.ndim != 2:
+        raise ValueError(f"Expected shape [Batch, num_targets], got {doa.shape}")
+
+    batch_size, num_targets = doa.shape
+
+    ncols = math.ceil(math.sqrt(num_targets))
+    nrows = math.ceil(num_targets / ncols)
+
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        subplot_kw={'projection': 'polar'},
+        layout='constrained',
+        figsize=(4 * ncols, 4 * nrows)
+    )
+
+    axes = np.array(axes).reshape(-1)
+
+    for target_idx in range(num_targets):
+        ax = axes[target_idx]
+
+        doa_target = doa[:, target_idx]
+        sig_target = sig[:, target_idx]
+
+        ax.scatter(doa_target + 90.0, sig_target, marker='o', label=f'Target {target_idx+1}')
+        ax.set_title(f"Target {target_idx+1}", va='bottom')
+        ax.set_rlabel_position(-30.0)
+        ax.grid(True)
+        ax.set_rorigin(0)
+        ax.set_rmax(90.0)
+        ax.set_thetamin(np.min(doa_target + 90.0) - 10)
+        ax.set_thetamax(np.max(doa_target + 90.0) + 10)
+        ax.legend()
+
+    # Hide unused subplots
+    for i in range(num_targets, len(axes)):
+        axes[i].set_visible(False)
+
+    fig.suptitle(title)
     plt.show()
-
 
 from scipy.optimize import linear_sum_assignment
 
@@ -269,7 +352,10 @@ class UncertaintyEstimation(nn.Module):
     def __init__(self, signal_shape):
         super().__init__()
         self.__signal_shape = signal_shape
+        self.__subarray_shift = 1
 
+    def set_subarray_shift(self, subarray_shift: int):
+        self.__subarray_shift = subarray_shift
 
     def doa_from_lam_deg(self, lam):
         # matches your esprit() sign convention
@@ -328,8 +414,9 @@ class UncertaintyEstimation(nn.Module):
         theta_hat_all = []  # list of (K,) in deg
         pred_hat_deg2_all = []  # list of (K,) predicted var using θ̂ in scale
 
+        #self.__subarray_shift = 4
         # 3) ESPRIT (overlapped, shift=1), use λ "as is"
-        esp = esprit_overlapped(Rhat, d_sources=dsrc, shift=1)
+        esp = esprit_overlapped(Rhat, d_sources=dsrc, shift=self.__subarray_shift)
         J1, J2, E_x = esp["J1"], esp["J2"], esp["E_x"]
         lam, V, Q = esp["lambda"], esp["V"], esp["Q"]
 
@@ -348,7 +435,7 @@ class UncertaintyEstimation(nn.Module):
             S_hat, alpha_hat, Rcov_conj, sig_idx, denom_eps=1e-6
         )
 
-        for g in range(dsrc):
+        """for g in range(dsrc):
             covHs_gh[g, g] = 0.5 * (covHs_gh[g, g] + covHs_gh[g, g].conj().T)
 
         for g in range(dsrc):
@@ -356,7 +443,7 @@ class UncertaintyEstimation(nn.Module):
                 A = 0.5 * (covHs_gh[g, h] + covHs_gh[h, g].conj().T)
                 covHs_gh[g, h] = A
                 covHs_gh[h, g] = A.conj().T
-
+        """
         #lam_u = lam / np.maximum(np.abs(lam), 1e-12)
         lam = lam / np.abs(lam)
         perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam)
@@ -431,4 +518,6 @@ class UncertaintyEstimation(nn.Module):
         uncertainty = torch.zeros_like(doas_deg)
         for index in range(doas_deg.shape[0]):
             uncertainty[index] = self.compute_predicated_uncertainty(doas_deg[index], Rx[index])
+
+        plot_sigma_vs_doa(doas_deg, torch.sqrt(uncertainty))
         return torch.sqrt(uncertainty)
