@@ -1,5 +1,7 @@
 import sys
 import os
+from signal import signal
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
@@ -17,7 +19,7 @@ from src.learned_agg_layer import match_learned_attn_shapes
 from src.localization_block import position_errors
 
 from src.visualization import visualize_ray_frame
-
+from src.uncertainty_block import plot_sigma_vs_doa
 
 from torch.profiler import (
     profile,
@@ -26,6 +28,29 @@ from torch.profiler import (
     ProfilerActivity,
     record_function,
 )
+
+from src.uncertainty_block import UncertaintyEstimation
+
+def calculate_true_uncertainty(doa_true, samples):
+    iq_samples = samples.squeeze(dim=2)
+    signal_shape_uncertainty = samples.shape[-1]
+    uncertainty_block = UncertaintyEstimation(signal_shape=signal_shape_uncertainty)
+    Rx_batch = []
+    M = 2
+    for batch_index in range(iq_samples.shape[0]):
+        Rx = []
+        for subarray_index in range(iq_samples.shape[1]):
+            Rx.append(torch.cov(iq_samples[batch_index, subarray_index, :, :]))
+        Rx_batch.append(torch.stack(Rx))
+
+    RX_batch = torch.stack(Rx_batch)
+    sigma_true = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], M)
+
+    for subarray_index in range(iq_samples.shape[1]):
+        sigma_true[:, subarray_index, :] = uncertainty_block.forward(torch.rad2deg(doa_true[:,subarray_index,:]), Rx=RX_batch[:, subarray_index,:,:])
+
+    for index in range(doa_true.shape[1]):
+        plot_sigma_vs_doa(torch.rad2deg(doa_true[:, index, :]), sigma_true[:, index, :], title="Sigma (with True Rx) vs True DoA")
 
 
 @torch.no_grad()
@@ -49,6 +74,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     doa_pred = model_result["bearings"]
                     sigma_pred = model_result["sigma_i"]
                     print(f'sigma_pred: {sigma_pred}')
+                    calculate_true_uncertainty(doa_gt, samples)
 
                     if model.estimate_position is True:
                         pos_pred = model_result["source_estimated_position"]

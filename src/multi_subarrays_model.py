@@ -9,7 +9,8 @@ from .models import SignalsSubspaceNetEsprit
 from .multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 from .localization_block import RayIntersection, triangulation_with_soft_area_batched, position_errors
 from .learned_agg_layer import LearnedAgg
-from .uncertainty_block import UncertaintyEstimation
+from .uncertainty_block import UncertaintyEstimation, plot_sigma_vs_doa
+
 
 def get_location_from_model_graph(model_graph, type_req='sensor'):
     """
@@ -132,6 +133,7 @@ class MultiSubarraysModel(nn.Module):
             if self.estimate_uncertainty is True:
                 with torch.no_grad():
                     sigma = self.uncertainty_pred[subarray_index].forward((doa_pred).rad2deg(), R)
+
                     sigma_i.insert(subarray_index, sigma)
 
 

@@ -126,6 +126,7 @@ class RMSPELoss(nn.Module):
         return result
 
 
+
 class MultiRMSPELoss(nn.Module):
     """Root Mean Square Periodic Error (RMSPE) loss function.
     This loss function calculates the RMSPE between the predicted values and the target values.
@@ -191,6 +192,87 @@ class MultiRMSPELoss(nn.Module):
             rmspe.append(rmspe_min)
         result = torch.sum(torch.stack(rmspe, dim = 0))
         return result
+
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import numpy as np
+import itertools
+
+
+class UEELoss(nn.Module):
+    """ Uncertainty Empirical Error loss function for Per-Source Uncertainty.
+    Calculates the L2 loss between predicted per-source variance and empirical per-source squared error.
+
+    Args:
+        reduction (str): Specifies the reduction to apply to the output: 'mean' or 'sum'. Default: 'sum'.
+    """
+
+    def __init__(self, reduction='mean'):
+        super(UEELoss, self).__init__()
+        self.reduction = reduction
+
+    def forward(self, uncertainty_prediction: torch.Tensor, doa_predictions: torch.Tensor,
+                doa: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            uncertainty_prediction (torch.Tensor): Predicted variance tensor [batch_size, num_predictions].
+            doa_predictions (torch.Tensor): Predicted DOA values tensor [batch_size, num_predictions].
+            doa (torch.Tensor): Target values tensor [batch_size, num_targets].
+
+        Returns:
+            torch.Tensor: The computed Uncertainty Empirical Error loss.
+        """
+        device = doa_predictions.device
+        batch_size, num_preds = doa_predictions.shape
+
+        # Generate all permutation indices once for the predictions
+        # Shape: [num_permutations, num_preds]
+        # This replaces the custom `permute_prediction` function to ensure safe alignment
+        perm_indices = torch.tensor(list(itertools.permutations(range(num_preds))), device=device)
+
+        uee_loss_list = []
+
+        for iter in range(batch_size):
+            batch_preds = doa_predictions[iter]  # Shape: [num_preds]
+            batch_uncert = uncertainty_prediction[iter]  # Shape: [num_preds]
+            targets = doa[iter]  # Shape: [num_preds]
+
+            # Apply the permutation indices to BOTH DOAs and Uncertainties
+            # Shapes become: [num_permutations, num_preds]
+            prediction_perms = batch_preds[perm_indices]
+            uncertainty_perms = batch_uncert[perm_indices]
+
+            # 1. Calculate wrapped angular error for all permutations simultaneously
+            error = (((prediction_perms - targets) + (np.pi / 2)) % np.pi) - np.pi / 2
+
+            # 2. Find the best assignment (permutation) based on DOA error
+            # We calculate the Mean Squared Error of the DOAs for each permutation
+            doa_mse_per_perm = torch.mean(error ** 2, dim=1)
+
+            # Get the index of the permutation that best aligns predictions with targets
+            best_perm_idx = torch.argmin(doa_mse_per_perm)
+
+            # 3. Extract the optimal alignment for error and uncertainty
+            best_error = error[best_perm_idx]  # Shape: [num_preds]
+            best_uncertainty = uncertainty_perms[best_perm_idx]  # Shape: [num_preds]
+
+            # 4. Calculate empirical variance per source (error squared)
+            empirical_variance = best_error ** 2
+
+            # 5. Calculate L2 loss between predicted per-source uncertainty and empirical variance
+            uee = F.mse_loss(best_uncertainty, empirical_variance, reduction='mean')
+
+            uee_loss_list.append(uee)
+
+        uee_tensor = torch.stack(uee_loss_list, dim=0)
+
+        # Apply the chosen batch reduction method
+        if self.reduction == 'mean':
+            return torch.mean(uee_tensor)
+        else:
+            return torch.sum(uee_tensor)
 
 
 class MSPELoss(nn.Module):

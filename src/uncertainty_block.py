@@ -334,7 +334,7 @@ def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
         ax.set_rlabel_position(-30.0)
         ax.grid(True)
         ax.set_rorigin(0)
-        ax.set_rmax(90.0)
+        ax.set_rmax(min(float(np.max(sig_target) * 1.20), 90.0))
         ax.set_thetamin(np.min(doa_target + 90.0) - 10)
         ax.set_thetamax(np.max(doa_target + 90.0) + 10)
         ax.legend()
@@ -493,10 +493,11 @@ class UncertaintyEstimation(nn.Module):
 
 
             #print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
-            print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
-
-
             pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
+            print(f'when Using lam_i {np.sqrt(pred_hat_deg2[i])=} {pred_hat_deg2[i]=} {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
+
+
+
             #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
 
         theta_hat_all.append(theta_hat_deg)
