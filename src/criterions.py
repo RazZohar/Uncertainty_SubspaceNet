@@ -283,13 +283,12 @@ class CombinedUncertaintyLoss(nn.Module):
     """
     Combined Accuracy and Reliability Loss for Multiple Subarrays.
 
-    Calculates the loss strictly on a PER-SOURCE basis:
-    Loss_per_source = lambda * (Error_per_source^2) + (1 - lambda) * UE_Loss_per_source
+    Calculates the loss by ACCUMULATING over the sources, and then averaging over the batch:
+    UE = mean_dataset[ sum_sources( (predicted_variance - empirical_error^2)^2 ) ]
 
     Args:
         lambda_val (float): Weighting factor between [0, 1].
         reduction (str): 'mean', 'sum', or 'none'.
-                         'none' now returns loss per source: shape [Batch, Subarray, Predictions]
     """
 
     def __init__(self, lambda_val=0.7, reduction='mean'):
@@ -299,7 +298,7 @@ class CombinedUncertaintyLoss(nn.Module):
 
     def forward(self, uncertainty_predictions: torch.Tensor, doa_predictions: torch.Tensor, doa: torch.Tensor):
         device = doa_predictions.device
-        B, S, P = doa_predictions.shape  # Batch, Subarrays, Predictions
+        B, S, P = doa_predictions.shape  # Batch, Subarrays, Predictions (Sources)
 
         # 1. Generate permutation indices for the predictions
         perm_indices = torch.tensor(list(itertools.permutations(range(P))), device=device)
@@ -320,8 +319,7 @@ class CombinedUncertaintyLoss(nn.Module):
         # 5. Calculate wrapped angular error modulo pi for all permutations
         error = (((preds_perm - targets_exp) + (np.pi / 2)) % np.pi) - np.pi / 2
 
-        # 6. Find the optimal alignment (permutation) for the subarray to ensure 1-to-1 matching
-        # We must find the lowest overall error for the subarray to assign the targets correctly
+        # 6. Find the optimal alignment (permutation) for the subarray (Global 1-to-1 matching)
         rmspe_squared_all = torch.mean(error ** 2, dim=3)
         best_perm_idx = torch.argmin(rmspe_squared_all, dim=2, keepdim=True)
 
@@ -339,33 +337,41 @@ class CombinedUncertaintyLoss(nn.Module):
         # A. Accuracy Loss Per Source (Squared Error)
         acc_loss_per_source = best_error ** 2
 
-        # B. Uncertainty Loss Per Source
-        # L2 loss between predicted variance (std_dev^2) and empirical variance (error^2)
+        # B. Uncertainty Loss Per Source (Variance vs Empirical Squared Error)
         predicted_variance = best_uncert ** 2
-        ue_loss_per_source = F.mse_loss(predicted_variance, acc_loss_per_source, reduction='none')
 
-        # C. Combined Loss Per Source
+        # Explicitly written exactly as your formula: (pred_var - error^2)^2
+        ue_loss_per_source = (predicted_variance - acc_loss_per_source) ** 2
+
+        # C. Combine Loss Per Source
         combined_loss_per_source = (self.lambda_val * acc_loss_per_source) + (
                     (1.0 - self.lambda_val) * ue_loss_per_source)
 
         # ---------------------------------------------------------
-        # REDUCTION AND RETURN
+        # THE FIX: ACCUMULATE OVER SOURCES (Sum across dim=2)
+        # ---------------------------------------------------------
+        # Shapes become: [Batch, Subarrays]
+        combined_loss_accumulated = torch.sum(combined_loss_per_source, dim=2)
+        acc_loss_accumulated = torch.sum(acc_loss_per_source, dim=2)
+        ue_loss_accumulated = torch.sum(ue_loss_per_source, dim=2)
+
+        # ---------------------------------------------------------
+        # REDUCTION OVER THE DATASET / BATCH
         # ---------------------------------------------------------
         if self.reduction == 'mean':
             return (
-                torch.mean(combined_loss_per_source),
-                torch.mean(acc_loss_per_source),
-                torch.mean(ue_loss_per_source)
+                torch.mean(combined_loss_accumulated),
+                torch.mean(acc_loss_accumulated),
+                torch.mean(ue_loss_accumulated)
             )
         elif self.reduction == 'sum':
             return (
-                torch.sum(combined_loss_per_source),
-                torch.sum(acc_loss_per_source),
-                torch.sum(ue_loss_per_source)
+                torch.sum(combined_loss_accumulated),
+                torch.sum(acc_loss_accumulated),
+                torch.sum(ue_loss_accumulated)
             )
         else:
-            # Returns the raw un-averaged tensors of shape [Batch, Subarrays, Predictions]
-            return combined_loss_per_source, acc_loss_per_source, ue_loss_per_source
+            return combined_loss_accumulated, acc_loss_accumulated, ue_loss_accumulated
 
 class MSPELoss(nn.Module):
     """Mean Square Periodic Error (MSPE) loss function.

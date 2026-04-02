@@ -1,20 +1,22 @@
 import sys
 import os
+import math
 from signal import signal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import torch
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 import wandb
 
 from trainer import graph_scene_collate
 from src.multi_subarrays_model import MultiSubarraysModel
 from src.multi_model_dataset import SensorSourceGraphDataset
-from src.criterions import RMSPELoss
 
-# To match attenation layers
+from src.criterions import RMSPELoss, CombinedUncertaintyLoss
+
 from src.learned_agg_layer import match_learned_attn_shapes
 from src.localization_block import position_errors
 
@@ -31,92 +33,134 @@ from torch.profiler import (
 
 from src.uncertainty_block import UncertaintyEstimation
 
-def calculate_true_uncertainty(doa_true, samples):
+
+def calculate_true_uncertainty(doa_true_rad, samples, plot=False):
+    """
+    Calculates the 'true' analytical uncertainty using the covariance matrix Rx.
+    Returns the tensor so it can be compared against the network's predictions.
+    """
+    device = doa_true_rad.device
     iq_samples = samples.squeeze(dim=2)
     signal_shape_uncertainty = samples.shape[-1]
-    uncertainty_block = UncertaintyEstimation(signal_shape=signal_shape_uncertainty)
+
+    uncertainty_block = UncertaintyEstimation(signal_shape=signal_shape_uncertainty).to(device)
+
+    # Dynamically grab the number of sources (removes hardcoded M=2)
+    num_sources = doa_true_rad.shape[-1]
+
     Rx_batch = []
-    M = 2
     for batch_index in range(iq_samples.shape[0]):
         Rx = []
         for subarray_index in range(iq_samples.shape[1]):
             Rx.append(torch.cov(iq_samples[batch_index, subarray_index, :, :]))
         Rx_batch.append(torch.stack(Rx))
 
-    RX_batch = torch.stack(Rx_batch)
-    sigma_true = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], M)
+    RX_batch = torch.stack(Rx_batch).to(device)
+    sigma_true = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], num_sources, device=device)
 
     for subarray_index in range(iq_samples.shape[1]):
-        sigma_true[:, subarray_index, :] = uncertainty_block.forward(torch.rad2deg(doa_true[:,subarray_index,:]), Rx=RX_batch[:, subarray_index,:,:])
+        sigma_true[:, subarray_index, :] = uncertainty_block.forward(
+            torch.rad2deg(doa_true_rad[:, subarray_index, :]),
+            Rx=RX_batch[:, subarray_index, :, :]
+        )
 
-    for index in range(doa_true.shape[1]):
-        plot_sigma_vs_doa(torch.rad2deg(doa_true[:, index, :]), sigma_true[:, index, :], title="Sigma (with True Rx) vs True DoA")
+    if plot:
+        for index in range(doa_true_rad.shape[1]):
+            plot_sigma_vs_doa(
+                torch.rad2deg(doa_true_rad[:, index, :]).cpu(),
+                sigma_true[:, index, :].cpu(),
+                title="Sigma (with True Rx) vs True DoA"
+            )
+
+    return sigma_true
 
 
 @torch.no_grad()
 def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=None):
     model.eval()
-    total_loss = 0.0
-    loss = 0.0
+
+    total_total_loss = 0.0
+    total_rmspe_sq = 0.0
+    total_ue_loss = 0.0
+    total_sigma_mae = 0.0  # Track the error between pred and true sigma
+    num_sources = 1
+
     for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
         with record_function("eval_step"):
             sensor_positions = sensor_positions.to(device)
             source_positions = source_positions.to(device)
             samples = samples.to(device)
+
             doa_gt = torch.deg2rad(doa_gt).to(device)
+            num_sources = doa_gt.shape[-1]
 
             if doa_only:
                 with record_function("model_forward_doa"):
                     model_result = model(sensor_positions, samples, doa_gt)
 
-
-                    #doa_pred, pos_pred, dop = model_result["bearings"], model_result["source_estimated_position"], model_result["dop"]
                     doa_pred = model_result["bearings"]
-                    sigma_pred = model_result["sigma_i"]
-                    print(f'sigma_pred: {sigma_pred}')
-                    calculate_true_uncertainty(doa_gt, samples)
+                    sigma_pred_deg = model_result["sigma_i"]
+
+                    # ---------------------------------------------------------
+                    # COMPARE PREDICTED SIGMA vs TRUE SIGMA
+                    # ---------------------------------------------------------
+                    # Calculate true sigma from Rx (Disable plotting for speed, or set to True)
+                    sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
+
+                    # Calculate Mean Absolute Error between network prediction and true calculation
+                    # Both are in degrees at this point
+                    sigma_mae = F.l1_loss(sigma_pred_deg, sigma_true_deg)
+                    total_sigma_mae += sigma_mae.item()
 
                     if model.estimate_position is True:
                         pos_pred = model_result["source_estimated_position"]
                         if model.estimate_uncertainty is True:
-                            position_metrics = position_errors(model_result["source_estimated_position"], model_result["source_estimated_position_wls"],
-                                                           source_positions)
-                            print(position_metrics)
+                            position_metrics = position_errors(
+                                model_result["source_estimated_position"],
+                                model_result["source_estimated_position_wls"],
+                                source_positions
+                            )
                             model_result["position_metrics"] = position_metrics
-
                     else:
-                        pos_pred = torch.zeros_like(source_positions[sample_index])
+                        pos_pred = torch.zeros_like(source_positions)
 
+                    # Vectorized Loss Calculation
+                    sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
+                    loss, rmspe_sq, ue_loss = criterion(sigma_pred_rad, doa_pred, doa_gt)
 
-                    for i in range(doa_gt.shape[1]):
-                        loss += criterion(doa_pred[:, i, :], doa_gt[:, i, :])
+                    total_total_loss += loss.item()
+                    total_rmspe_sq += rmspe_sq.item()
+                    total_ue_loss += ue_loss.item()
 
-                    for sample_index in range(10):
+                    # Visualization
+                    for sample_index in range(min(10, sensor_positions.shape[0])):
                         visualize_ray_frame(
-                            positions=sensor_positions[sample_index],  # (M, 2)
-                            bearings=doa_pred[sample_index],  # (M,)
-                            x_hat=pos_pred[sample_index],  # (2,)
-                            x_true=source_positions[sample_index],  # (2,)
-                            sigmas=torch.deg2rad(sigma_pred[sample_index]),
-                            #sigmas=torch.zeros_like(doa_pred[sample_index]),
+                            positions=sensor_positions[sample_index],
+                            bearings=doa_pred[sample_index],
+                            x_hat=pos_pred[sample_index],
+                            x_true=source_positions[sample_index],
+                            sigmas=torch.deg2rad(sigma_pred_deg[sample_index]),
                             step=step,
                             save_path=f"visualizations/sample_{sample_index:03d}_test_{step:03d}.png"
                         )
-
-
 
             else:
                 with record_function("model_forward_pos"):
                     pred = model(sensor_positions, samples, None)
                 loss = criterion(pred, source_positions)
+                total_total_loss += loss.item()
 
-            total_loss += loss.item()
-
-        # advance profiler step at the end of each iteration
         if profiler is not None:
             profiler.step()
 
-    return total_loss / (len(loader) * batch_size)
+    divisor = len(loader)
+    return {
+        "total_loss": total_total_loss / divisor,
+        "rmspe_sq": total_rmspe_sq / divisor,
+        "ue_loss": total_ue_loss / divisor,
+        "sigma_mae": total_sigma_mae / divisor,  # Return the new metric
+        "num_sources": num_sources
+    }
 
 
 def main(profiler=None):
@@ -132,7 +176,6 @@ def main(profiler=None):
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # Load test dataset
     test_ds: SensorSourceGraphDataset = torch.load(args.test_dataset_path, weights_only=False)
     test_ds.set_use_graph_features(use_features=True)
 
@@ -145,34 +188,30 @@ def main(profiler=None):
         drop_last=False,
     )
 
-    # Extract sensor positions from test dataset
     sensor_positions = test_ds.get_sensor_potision()
 
-    # Build model
     model = MultiSubarraysModel(
         sensors_positions=sensor_positions,
         multi_model_configuration=args.config_path,
         args=args
     ).to(device)
 
-    # Estimate the uncertainty
     model.estimate_uncertainty = True
     model.estimate_position = True
 
-    # Load best checkpoint
     checkpoint = torch.load(args.checkpoint_path, map_location=device)
     match_learned_attn_shapes(model, checkpoint["model_state_dict"])
     model.load_state_dict(checkpoint["model_state_dict"])
 
-    # Criterion
-    criterion = RMSPELoss() if args.train_doa_only else torch.nn.MSELoss()
+    if args.train_doa_only:
+        criterion = CombinedUncertaintyLoss(lambda_val=0.5, reduction='mean')
+    else:
+        criterion = torch.nn.MSELoss()
 
-    # Optional W&B logging
     if args.log_to_wandb:
         wandb.init(project="multi-subarrays-doa", job_type="test")
 
-    # Evaluate (optionally under profiler)
-    test_loss = evaluate(
+    test_metrics = evaluate(
         model,
         test_loader,
         criterion,
@@ -181,10 +220,37 @@ def main(profiler=None):
         doa_only=args.train_doa_only,
         profiler=profiler,
     )
-    print(f"Test loss: {test_loss:.6f}")
+
+    # ---------------------------------------------------------
+    # PRINT RESULTS
+    # ---------------------------------------------------------
+    if args.train_doa_only:
+        acc_deg = math.degrees(math.sqrt(test_metrics["rmspe_sq"] / test_metrics["num_sources"]))
+        mean_ue = test_metrics["ue_loss"]
+        sigma_mae = test_metrics["sigma_mae"]
+
+        print(f"\n{'=' * 50}")
+        print("📊 TEST EVALUATION RESULTS")
+        print(f"{'=' * 50}")
+        print(f"Combined Total Loss      : {test_metrics['total_loss']:.6f}")
+        print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°")
+        print(f"Reliability (Mean UE)    : {mean_ue:.3e}")
+        print(f"Pred vs True Sigma (MAE) : {sigma_mae:.3f}°  <-- Network Variance Accuracy")
+        print(f"{'=' * 50}\n")
+
+        if args.log_to_wandb:
+            wandb.log({
+                "test_total_loss": test_metrics["total_loss"],
+                "test_acc_degrees": acc_deg,
+                "test_mean_ue_loss": mean_ue,
+                "test_pred_vs_true_sigma_mae": sigma_mae
+            })
+    else:
+        print(f"Test Loss (MSE): {test_metrics['total_loss']:.6f}")
+        if args.log_to_wandb:
+            wandb.log({"test_loss": test_metrics["total_loss"]})
 
     if args.log_to_wandb:
-        wandb.log({"test_loss": test_loss})
         wandb.finish()
 
 
