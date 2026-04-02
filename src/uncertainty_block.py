@@ -451,9 +451,9 @@ class UncertaintyEstimation(nn.Module):
         V_ext = V[:, perm_ext_to_int]
         Q_ext = Q[:, perm_ext_to_int]
 
-        print("external doa:", theta_hat_deg)
+        #print("external doa:", theta_hat_deg)
         #print("internal doa :", doa_int)
-        print("matched doa  :", self.doa_from_lam_deg(lam_ext))
+        #print("matched doa  :", self.doa_from_lam_deg(lam_ext))
 
         matced_doas =  self.doa_from_lam_deg(lam_ext)
 
@@ -494,8 +494,9 @@ class UncertaintyEstimation(nn.Module):
 
             #print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
             pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
-            print(f'when Using lam_i {np.sqrt(pred_hat_deg2[i])=} {pred_hat_deg2[i]=} {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
-
+            #print(f'when Using lam_i {np.sqrt(pred_hat_deg2[i])=} {pred_hat_deg2[i]=} {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
+            # CLip at maximum 90 degree of uncertainty
+            pred_hat_deg2 = np.clip(pred_hat_deg2, a_max=8100.0, a_min=0.0)
 
 
             #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
@@ -520,5 +521,5 @@ class UncertaintyEstimation(nn.Module):
         for index in range(doas_deg.shape[0]):
             uncertainty[index] = self.compute_predicated_uncertainty(doas_deg[index], Rx[index])
 
-        plot_sigma_vs_doa(doas_deg, torch.sqrt(uncertainty))
+        #plot_sigma_vs_doa(doas_deg, torch.sqrt(uncertainty))
         return torch.sqrt(uncertainty)

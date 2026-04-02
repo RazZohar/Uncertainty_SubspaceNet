@@ -1,0 +1,31 @@
+{
+  "stages": [
+    {
+      "name": "Stage 1: Pure Accuracy (RMSPE Only)",
+      "epochs": 30,
+      "train_scopes": ["subarray_model"],
+      "train_doa_only": true,
+      "loss_function": "CombinedUncertaintyLoss",
+      "lambda_val": 1.0,
+      "learning_rate": 0.001
+    },
+    {
+      "name": "Stage 2: Introduce Reliability",
+      "epochs": 5,
+      "train_scopes": ["subarray_model"],
+      "train_doa_only": true,
+      "loss_function": "CombinedUncertaintyLoss",
+      "lambda_val": 0.7,
+      "learning_rate": 0.0005
+    },
+    {
+      "name": "Stage 3: Fine-tune Reliability",
+      "epochs": 5,
+      "train_scopes": ["subarray_model"],
+      "train_doa_only": true,
+      "loss_function": "CombinedUncertaintyLoss",
+      "lambda_val": 0.6,
+      "learning_rate": 0.0001
+    }
+  ]
+}

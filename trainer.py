@@ -24,6 +24,7 @@ import wandb
 
 import random
 import numpy as np
+import math
 
 from src.multi_subarrays_model import MultiSubarraysModel
 from src.multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
@@ -33,7 +34,7 @@ from src.criterions import RMSPELoss
 
 
 # If you implemented UEELoss, you can import it here
-# from src.criterions import UEELoss
+from src.criterions import UEELoss, CombinedUncertaintyLoss
 
 # -----------------------------------------------------------------------------
 # collate_fn – keeps heterogeneous objects intact
@@ -88,6 +89,8 @@ class Trainer:
 
         # ---------------- Model ----------------
         self.model = self._build_model().to(self.device)
+
+        self.model.estimate_uncertainty = True
 
         # --- Log config artifacts to wandb ---
         configuration_artifact = wandb.Artifact(name="config_json", type="config")
@@ -150,11 +153,23 @@ class Trainer:
         )
 
         # 6. Re-initialize Loss Function
+        # 6. Re-initialize Loss Function
         loss_name = stage_config.get("loss_function", "MSELoss")
-        if loss_name == "RMSPELoss":
+
+        if loss_name == "CombinedUncertaintyLoss":
+            # Extract lambda from the JSON, default to 0.75 if not found
+            stage_lambda = stage_config.get("lambda_val", 0.75)
+            self.criterion = CombinedUncertaintyLoss(lambda_val=stage_lambda)
+            print(f"   * Loss: {loss_name} (Lambda: {stage_lambda})")
+
+        elif loss_name == "RMSPELoss":
             self.criterion = RMSPELoss()
+            print(f"   * Loss: {loss_name}")
+
         elif loss_name == "MSELoss":
             self.criterion = nn.MSELoss()
+            print(f"   * Loss: {loss_name}")
+
         else:
             raise ValueError(f"Unknown loss function requested: {loss_name}")
 
@@ -261,10 +276,14 @@ class Trainer:
                     # UPDATED: Extract using your specific key "sigma_i"
                     # Shape must be: [Batch_size, Num_subarrays, Num_preds]
                     # -----------------------------------------------------
-                    uncert_pred = model_result["sigma_i"]
+                    # 1. Extract uncertainty (in degrees)
+                    uncert_pred_deg = model_result["sigma_i"]
 
-                    # Calculate combined loss and individual metrics
-                    loss, rmspe_sq, ue_loss = self.criterion(uncert_pred, doa_pred, doa_gt)
+                    # 2. MATCH UNITS: Convert to radians so the loss math works!
+                    uncert_pred_rad = torch.deg2rad(uncert_pred_deg)
+
+                    # 3. Calculate combined loss and individual metrics in pure radians
+                    loss, rmspe_sq, ue_loss = self.criterion(uncert_pred_rad, doa_pred, doa_gt)
 
                     # Accumulate for logging
                     running_rmspe_sq += rmspe_sq.item()
@@ -349,11 +368,10 @@ class Trainer:
                 # ---- Validation ----
                 if global_epoch % self.args.val_freq == 0 or local_epoch == self.current_epochs - 1:
 
-                    # val_epoch also returns a dictionary
                     val_metrics = self.val_epoch()
                     val_total_loss = val_metrics["total_loss"]
 
-                    # Log independent val metrics
+                    # Log independent val metrics to W&B
                     wandb.log({
                         "global_epoch": global_epoch,
                         "val_total_loss": val_total_loss,
@@ -361,18 +379,30 @@ class Trainer:
                         "val_ue_loss": val_metrics["ue_loss"],
                     })
 
+                    # --- CONVERT TO DEGREES FOR PRINTING ---
+                    # RMSPE = sqrt(mean_squared_error) * (180 / pi)
+                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"]))
+                    val_acc_deg = math.degrees(math.sqrt(val_metrics["rmspe_sq"]))
+
+                    # Format strings for clean command line output
+                    train_str = f"Train Loss: {train_metrics['total_loss']:.5f} (Acc: {train_acc_deg:.3f}°, UE: {train_metrics['ue_loss']:.4e})"
+                    val_str = f"Val Loss: {val_total_loss:.5f} (Acc: {val_acc_deg:.3f}°, UE: {val_metrics['ue_loss']:.4e})"
+
                     if val_total_loss < best_val:
                         best_val = val_total_loss
                         self._save_checkpoint(global_epoch, is_best=True)
                         print(
-                            f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] *new best* train={train_metrics['total_loss']:.6f} val={val_total_loss:.6f}")
+                            f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] *NEW BEST* | {train_str} | {val_str}")
                     else:
-                        print(
-                            f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] train={train_metrics['total_loss']:.6f} val={val_total_loss:.6f}")
+                        print(f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] {train_str} | {val_str}")
                 else:
                     self._save_checkpoint(global_epoch, is_best=False)
-                    print(
-                        f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] train={train_metrics['total_loss']:.6f}")
+
+                    # --- CONVERT TO DEGREES FOR PRINTING (TRAIN ONLY) ---
+                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"]))
+                    train_str = f"Train Loss: {train_metrics['total_loss']:.4f} (Acc: {train_acc_deg:.2f}°, UE: {train_metrics['ue_loss']:.1e})"
+
+                    print(f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] {train_str}")
 
                 # ---- Visualization ----
                 if self.args.visualize:

@@ -283,17 +283,13 @@ class CombinedUncertaintyLoss(nn.Module):
     """
     Combined Accuracy and Reliability Loss for Multiple Subarrays.
 
-    Calculates: Loss = lambda * (RMSPE^2) + (1 - lambda) * UE_Loss
-
-    By combining these into one module, we only compute the expensive O(N!)
-    permutations once, making the training significantly faster.
+    Calculates the loss strictly on a PER-SOURCE basis:
+    Loss_per_source = lambda * (Error_per_source^2) + (1 - lambda) * UE_Loss_per_source
 
     Args:
         lambda_val (float): Weighting factor between [0, 1].
-                            1.0 = Pure Accuracy (RMSPE^2 only)
-                            0.0 = Pure Reliability (UE Loss only)
-                            0.5 = Equal weighting
         reduction (str): 'mean', 'sum', or 'none'.
+                         'none' now returns loss per source: shape [Batch, Subarray, Predictions]
     """
 
     def __init__(self, lambda_val=0.7, reduction='mean'):
@@ -302,15 +298,6 @@ class CombinedUncertaintyLoss(nn.Module):
         self.reduction = reduction
 
     def forward(self, uncertainty_predictions: torch.Tensor, doa_predictions: torch.Tensor, doa: torch.Tensor):
-        """
-        Args:
-            uncertainty_predictions (torch.Tensor): Predicted variances [Batch, Subarray, Predictions]
-            doa_predictions (torch.Tensor): Predicted DOAs [Batch, Subarray, Predictions]
-            doa (torch.Tensor): Ground truth DOAs [Batch, Subarray, Targets]
-
-        Returns:
-            torch.Tensor: The weighted combined loss.
-        """
         device = doa_predictions.device
         B, S, P = doa_predictions.shape  # Batch, Subarrays, Predictions
 
@@ -333,58 +320,52 @@ class CombinedUncertaintyLoss(nn.Module):
         # 5. Calculate wrapped angular error modulo pi for all permutations
         error = (((preds_perm - targets_exp) + (np.pi / 2)) % np.pi) - np.pi / 2
 
-        # 6. Calculate RMSPE^2 for all permutations.
-        # Note: RMSPE^2 is exactly the Mean Squared Periodic Error.
-        # Shape: [B, S, num_perms]
+        # 6. Find the optimal alignment (permutation) for the subarray to ensure 1-to-1 matching
+        # We must find the lowest overall error for the subarray to assign the targets correctly
         rmspe_squared_all = torch.mean(error ** 2, dim=3)
-
-        # 7. Find the optimal alignment (the permutation with the lowest RMSPE^2)
-        # Shape: [B, S, 1]
         best_perm_idx = torch.argmin(rmspe_squared_all, dim=2, keepdim=True)
-
-        # --- EXTRACT OPTIMAL VALUES ---
-
-        # Extract best RMSPE^2 per subarray: Shape [B, S]
-        best_rmspe_squared = torch.gather(rmspe_squared_all, dim=2, index=best_perm_idx).squeeze(2)
 
         # Expand index to gather the matching errors and uncertainties: [B, S, 1, P]
         best_perm_idx_exp = best_perm_idx.unsqueeze(3).expand(B, S, 1, P)
+
+        # ---------------------------------------------------------
+        # PER-SOURCE LOSS CALCULATION
+        # ---------------------------------------------------------
 
         # Extract optimal error and uncertainty: Shapes [B, S, P]
         best_error = torch.gather(error, dim=2, index=best_perm_idx_exp).squeeze(2)
         best_uncert = torch.gather(uncert_perm, dim=2, index=best_perm_idx_exp).squeeze(2)
 
-        # --- CALCULATE UE LOSS ---
+        # A. Accuracy Loss Per Source (Squared Error)
+        acc_loss_per_source = best_error ** 2
 
-        # Empirical variance is the optimal error squared for each specific source
-        empirical_variance = best_error ** 2
+        # B. Uncertainty Loss Per Source
+        # L2 loss between predicted variance (std_dev^2) and empirical variance (error^2)
+        predicted_variance = best_uncert ** 2
+        ue_loss_per_source = F.mse_loss(predicted_variance, acc_loss_per_source, reduction='none')
 
-        # L2 loss between predicted uncertainty and actual empirical variance
-        # Shape [B, S, P] -> Average over predictions to get shape [B, S]
-        ue_loss_per_source = F.mse_loss(best_uncert, empirical_variance, reduction='none')
-        ue_loss_per_subarray = torch.mean(ue_loss_per_source, dim=2)
+        # C. Combined Loss Per Source
+        combined_loss_per_source = (self.lambda_val * acc_loss_per_source) + (
+                    (1.0 - self.lambda_val) * ue_loss_per_source)
 
-        # --- COMBINE LOSSES ---
-
-        # Loss = lambda * RMSPE^2 + (1 - lambda) * UE_Loss
-        combined_loss_per_subarray = ((self.lambda_val * best_rmspe_squared) +
-                                      ((1.0 - self.lambda_val) * ue_loss_per_subarray))
-
-        # --- REDUCTION ---
+        # ---------------------------------------------------------
+        # REDUCTION AND RETURN
+        # ---------------------------------------------------------
         if self.reduction == 'mean':
             return (
-                torch.mean(combined_loss_per_subarray),
-                torch.mean(best_rmspe_squared),
-                torch.mean(ue_loss_per_subarray)
+                torch.mean(combined_loss_per_source),
+                torch.mean(acc_loss_per_source),
+                torch.mean(ue_loss_per_source)
             )
         elif self.reduction == 'sum':
             return (
-                torch.sum(combined_loss_per_subarray),
-                torch.sum(best_rmspe_squared),
-                torch.sum(ue_loss_per_subarray)
+                torch.sum(combined_loss_per_source),
+                torch.sum(acc_loss_per_source),
+                torch.sum(ue_loss_per_source)
             )
         else:
-            return combined_loss_per_subarray, best_rmspe_squared, ue_loss_per_subarray
+            # Returns the raw un-averaged tensors of shape [Batch, Subarrays, Predictions]
+            return combined_loss_per_source, acc_loss_per_source, ue_loss_per_source
 
 class MSPELoss(nn.Module):
     """Mean Square Periodic Error (MSPE) loss function.
