@@ -1,13 +1,14 @@
 import sys
 import os
 import math
+import itertools
 from signal import signal
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import torch
-import torch.nn.functional as F
+import numpy as np
 from torch.utils.data import DataLoader
 import wandb
 
@@ -36,16 +37,13 @@ from src.uncertainty_block import UncertaintyEstimation
 
 def calculate_true_uncertainty(doa_true_rad, samples, plot=False):
     """
-    Calculates the 'true' analytical uncertainty using the covariance matrix Rx.
-    Returns the tensor so it can be compared against the network's predictions.
+    Calculates the 'true' analytical uncertainty (sigma in degrees) using the covariance matrix Rx.
     """
     device = doa_true_rad.device
     iq_samples = samples.squeeze(dim=2)
     signal_shape_uncertainty = samples.shape[-1]
 
     uncertainty_block = UncertaintyEstimation(signal_shape=signal_shape_uncertainty).to(device)
-
-    # Dynamically grab the number of sources (removes hardcoded M=2)
     num_sources = doa_true_rad.shape[-1]
 
     Rx_batch = []
@@ -69,10 +67,41 @@ def calculate_true_uncertainty(doa_true_rad, samples, plot=False):
             plot_sigma_vs_doa(
                 torch.rad2deg(doa_true_rad[:, index, :]).cpu(),
                 sigma_true[:, index, :].cpu(),
-                title="Sigma (with True Rx) vs True DoA"
+                title=f"Sigma (with True Rx) vs True DoA (Subarray {index})"
             )
 
     return sigma_true
+
+
+def get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad):
+    """
+    Calculates the exact UE metric using the True Theoretical Sigma.
+    """
+    device = doa_pred.device
+    B, S, P = doa_pred.shape
+
+    perm_indices = torch.tensor(list(itertools.permutations(range(P))), device=device)
+    num_perms = perm_indices.shape[0]
+
+    preds_exp = doa_pred.unsqueeze(2).expand(B, S, num_perms, P)
+    perms_exp = perm_indices.view(1, 1, num_perms, P).expand(B, S, num_perms, P)
+    preds_perm = torch.gather(preds_exp, dim=3, index=perms_exp)
+
+    targets_exp = doa_gt.unsqueeze(2)
+    error = (((preds_perm - targets_exp) + (np.pi / 2)) % np.pi) - np.pi / 2
+
+    rmspe_squared_all = torch.mean(error ** 2, dim=3)
+    best_perm_idx = torch.argmin(rmspe_squared_all, dim=2, keepdim=True)
+    best_perm_idx_exp = best_perm_idx.unsqueeze(3).expand(B, S, 1, P)
+
+    best_error = torch.gather(error, dim=2, index=best_perm_idx_exp).squeeze(2)
+
+    empirical_variance = best_error ** 2
+    true_variance = sigma_true_rad ** 2
+
+    ue_loss_per_source = (true_variance - empirical_variance) ** 2
+    accumulated_ue = torch.sum(ue_loss_per_source, dim=2)
+    return torch.mean(accumulated_ue).item()
 
 
 @torch.no_grad()
@@ -81,8 +110,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
 
     total_total_loss = 0.0
     total_rmspe_sq = 0.0
-    total_ue_loss = 0.0
-    total_sigma_mae = 0.0  # Track the error between pred and true sigma
+    total_net_ue_loss = 0.0
+    total_true_ue_loss = 0.0
     num_sources = 1
 
     for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
@@ -101,16 +130,18 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     doa_pred = model_result["bearings"]
                     sigma_pred_deg = model_result["sigma_i"]
 
-                    # ---------------------------------------------------------
-                    # COMPARE PREDICTED SIGMA vs TRUE SIGMA
-                    # ---------------------------------------------------------
-                    # Calculate true sigma from Rx (Disable plotting for speed, or set to True)
                     sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
 
-                    # Calculate Mean Absolute Error between network prediction and true calculation
-                    # Both are in degrees at this point
-                    sigma_mae = F.l1_loss(sigma_pred_deg, sigma_true_deg)
-                    total_sigma_mae += sigma_mae.item()
+                    sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
+                    loss, rmspe_sq, net_ue_loss = criterion(sigma_pred_rad, doa_pred, doa_gt)
+
+                    sigma_true_rad = torch.deg2rad(sigma_true_deg)
+                    true_ue_loss = get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad)
+
+                    total_total_loss += loss.item()
+                    total_rmspe_sq += rmspe_sq.item()
+                    total_net_ue_loss += net_ue_loss.item() if isinstance(net_ue_loss, torch.Tensor) else net_ue_loss
+                    total_true_ue_loss += true_ue_loss
 
                     if model.estimate_position is True:
                         pos_pred = model_result["source_estimated_position"]
@@ -121,28 +152,6 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                                 source_positions
                             )
                             model_result["position_metrics"] = position_metrics
-                    else:
-                        pos_pred = torch.zeros_like(source_positions)
-
-                    # Vectorized Loss Calculation
-                    sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
-                    loss, rmspe_sq, ue_loss = criterion(sigma_pred_rad, doa_pred, doa_gt)
-
-                    total_total_loss += loss.item()
-                    total_rmspe_sq += rmspe_sq.item()
-                    total_ue_loss += ue_loss.item()
-
-                    # Visualization
-                    for sample_index in range(min(10, sensor_positions.shape[0])):
-                        visualize_ray_frame(
-                            positions=sensor_positions[sample_index],
-                            bearings=doa_pred[sample_index],
-                            x_hat=pos_pred[sample_index],
-                            x_true=source_positions[sample_index],
-                            sigmas=torch.deg2rad(sigma_pred_deg[sample_index]),
-                            step=step,
-                            save_path=f"visualizations/sample_{sample_index:03d}_test_{step:03d}.png"
-                        )
 
             else:
                 with record_function("model_forward_pos"):
@@ -157,8 +166,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
     return {
         "total_loss": total_total_loss / divisor,
         "rmspe_sq": total_rmspe_sq / divisor,
-        "ue_loss": total_ue_loss / divisor,
-        "sigma_mae": total_sigma_mae / divisor,  # Return the new metric
+        "net_ue_loss": total_net_ue_loss / divisor,
+        "true_ue_loss": total_true_ue_loss / divisor,
         "num_sources": num_sources
     }
 
@@ -172,6 +181,11 @@ def main(profiler=None):
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_to_wandb", action="store_true")
+
+    # Visualization Arguments
+    parser.add_argument("--visualize", action="store_true", help="Generate frame visualizations for the test set")
+    parser.add_argument("--visualize_num", type=int, default=5, help="Number of samples to visualize")
+    parser.add_argument("--visualize_sigma", action="store_true", help="Plot Predicted and True Sigma vs DoA")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -226,29 +240,112 @@ def main(profiler=None):
     # ---------------------------------------------------------
     if args.train_doa_only:
         acc_deg = math.degrees(math.sqrt(test_metrics["rmspe_sq"] / test_metrics["num_sources"]))
-        mean_ue = test_metrics["ue_loss"]
-        sigma_mae = test_metrics["sigma_mae"]
 
-        print(f"\n{'=' * 50}")
+        print(f"\n{'=' * 55}")
         print("📊 TEST EVALUATION RESULTS")
-        print(f"{'=' * 50}")
+        print(f"{'=' * 55}")
         print(f"Combined Total Loss      : {test_metrics['total_loss']:.6f}")
-        print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°")
-        print(f"Reliability (Mean UE)    : {mean_ue:.3e}")
-        print(f"Pred vs True Sigma (MAE) : {sigma_mae:.3f}°  <-- Network Variance Accuracy")
-        print(f"{'=' * 50}\n")
+        print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°\n")
+
+        print(f"Reliability (Accumulated UE Loss):")
+        print(f"  - Network UE Loss      : {test_metrics['net_ue_loss']:.3e}")
+        print(f"  - Theoretical UE Loss  : {test_metrics['true_ue_loss']:.3e}")
+        print(f"{'=' * 55}\n")
 
         if args.log_to_wandb:
             wandb.log({
                 "test_total_loss": test_metrics["total_loss"],
                 "test_acc_degrees": acc_deg,
-                "test_mean_ue_loss": mean_ue,
-                "test_pred_vs_true_sigma_mae": sigma_mae
+                "test_network_ue_loss": test_metrics["net_ue_loss"],
+                "test_theoretical_ue_loss": test_metrics["true_ue_loss"],
             })
     else:
         print(f"Test Loss (MSE): {test_metrics['total_loss']:.6f}")
         if args.log_to_wandb:
             wandb.log({"test_loss": test_metrics["total_loss"]})
+
+    # ---------------------------------------------------------
+    # VISUALIZATION LOGIC
+    # ---------------------------------------------------------
+    if args.visualize or args.visualize_sigma:
+        print("🎨 Generating Visualizations...")
+
+        # Grab the first batch for visualization
+        batch = next(iter(test_loader))
+        sensor_pos, source_pos, iq_samples, doa_gt = batch
+
+        sensor_pos = sensor_pos.to(device)
+        source_pos = source_pos.to(device)
+        iq_samples = iq_samples.to(device)
+        doa_gt = torch.deg2rad(doa_gt).to(device)
+
+        model.eval()
+        with torch.no_grad():
+            if args.train_doa_only:
+                model_result = model(sensor_pos, iq_samples, doa_gt)
+                doa_pred = model_result["bearings"]
+                sigma_pred_deg = model_result["sigma_i"]
+
+                if model.estimate_position:
+                    pos_pred = model_result.get("source_estimated_position", torch.zeros_like(source_pos))
+                else:
+                    pos_pred = torch.zeros_like(source_pos)
+            else:
+                pos_pred = model(sensor_pos, iq_samples, None)
+                doa_pred = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], source_pos.shape[1]).to(device)
+                sigma_pred_deg = None
+
+        # --- Plot Position / DoA Frames ---
+        if args.visualize:
+            os.makedirs("visualizations/test", exist_ok=True)
+            num_vis = min(args.visualize_num, iq_samples.shape[0])
+            for sample_index in range(num_vis):
+                save_path = f"visualizations/test/test_sample_{sample_index:03d}.png"
+
+                # --- NEW: Safely get and convert sigmas to radians for visualization ---
+                current_sigmas = None
+                if sigma_pred_deg is not None:
+                    current_sigmas = torch.deg2rad(sigma_pred_deg[sample_index])
+
+                visualize_ray_frame(
+                    positions=sensor_pos[sample_index],
+                    bearings=doa_pred[sample_index],
+                    x_hat=pos_pred[sample_index],
+                    x_true=source_pos[sample_index],
+                    sigmas=current_sigmas,  # Passed in radians
+                    step=0,
+                    save_path=save_path
+                )
+
+                if args.log_to_wandb:
+                    wandb.log({
+                        f"test_viz/sample_{sample_index}": wandb.Image(save_path)
+                    })
+
+            print(f"✅ Saved {num_vis} frame visualizations to 'visualizations/test/'")
+
+        # --- Plot Sigma vs DoA ---
+        if args.visualize_sigma and args.train_doa_only:
+            print("📈 Generating Sigma vs DoA plots...")
+
+            # Calculate the True Sigma
+            sigma_true_deg = calculate_true_uncertainty(doa_gt, iq_samples, plot=False)
+
+            for subarray_index in range(doa_gt.shape[1]):
+                # Plot Model's Predicted Sigma
+                plot_sigma_vs_doa(
+                    torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
+                    sigma_pred_deg[:, subarray_index, :].cpu(),
+                    title=f"Predicted Sigma vs True DoA (Subarray {subarray_index})"
+                )
+
+                # Plot True Analytical Sigma
+                plot_sigma_vs_doa(
+                    torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
+                    sigma_true_deg[:, subarray_index, :].cpu(),
+                    title=f"True Sigma vs True DoA (Subarray {subarray_index})"
+                )
+            print("✅ Sigma plots generated.")
 
     if args.log_to_wandb:
         wandb.finish()

@@ -2,16 +2,9 @@ import os
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
 import glob
 import imageio.v2 as imageio  # safer for compatibility
-
-
-import os
-import numpy as np
-import matplotlib.pyplot as plt
 from matplotlib import patches
-
 
 def visualize_ray_frame(positions,
                         bearings,
@@ -93,6 +86,19 @@ def visualize_ray_frame(positions,
 
     # sensors
     ax.plot(positions[:, 0], positions[:, 1], 'ko', label='Sensors')
+
+    # --- NEW: Annotate Sensor IDs ---
+    for k in range(K):
+        ax.annotate(
+            f'sensor_id_{k+1}',
+            (positions[k, 0], positions[k, 1]),
+            textcoords="offset points",
+            xytext=(5, 5),     # 5px right, 5px up
+            ha='left',
+            fontsize=11,
+            weight='bold',
+            color='black'
+        )
 
     # colors per source
     colors = plt.cm.tab10(np.linspace(0, 1, max(M, 1)))
@@ -179,9 +185,6 @@ def visualize_ray_frame(positions,
         plt.close(fig)
     else:
         plt.show()
-
-
-
 
 def create_sample_gif(sample_idx: int, save_dir: str = "visualizations", gif_path: str = None, fps: int = 2):
     """

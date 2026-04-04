@@ -32,9 +32,9 @@ from src.system_model import SystemModelParams
 from src.models import ModelGenerator
 from src.criterions import RMSPELoss
 
-
 # If you implemented UEELoss, you can import it here
 from src.criterions import UEELoss, CombinedUncertaintyLoss
+
 
 # -----------------------------------------------------------------------------
 # collate_fn – keeps heterogeneous objects intact
@@ -153,7 +153,6 @@ class Trainer:
         )
 
         # 6. Re-initialize Loss Function
-        # 6. Re-initialize Loss Function
         loss_name = stage_config.get("loss_function", "MSELoss")
 
         if loss_name == "CombinedUncertaintyLoss":
@@ -226,16 +225,26 @@ class Trainer:
         # ignored here because multi-stage dynamically rebuilds them.
         return ckpt.get("global_epoch", ckpt.get("epoch", 0))
 
-    def _save_checkpoint(self, global_epoch: int, is_best: bool = False):
+    def _save_checkpoint(self, global_epoch: int, is_best: bool = False, stage_name: str = None,
+                         stage_prefix: str = None):
         ckpt = {
             "global_epoch": global_epoch,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
         }
+
+        # Always save latest
         torch.save(ckpt, self.args.checkpoint_dir / "latest.pth")
+
+        # --- Save best for specific stage using prefix ---
         if is_best:
-            torch.save(ckpt, self.args.checkpoint_dir / "best.pth")
+            best_filename = f"best_{stage_prefix}.pth" if stage_prefix else "best.pth"
+            torch.save(ckpt, self.args.checkpoint_dir / best_filename)
+
+        # Save the stage completion snapshot
+        if stage_name:
+            torch.save(ckpt, self.args.checkpoint_dir / f"{stage_name}.pth")
 
     # ---------------------------------------------------------------------
     # Epoch loops
@@ -253,6 +262,7 @@ class Trainer:
         running_total_loss = 0.0
         running_rmspe_sq = 0.0
         running_ue_loss = 0.0
+        current_num_sources = 1  # Dynamically track sources for metric printouts
 
         ctx = torch.enable_grad() if train else torch.no_grad()
 
@@ -265,6 +275,9 @@ class Trainer:
                 samples = samples.to(self.device)
                 doa_gt = np.radians(doa_gt.to(self.device))
 
+                # Extract number of sources dynamically
+                current_num_sources = doa_gt.shape[-1]
+
                 if train:
                     self.optimizer.zero_grad()
 
@@ -272,10 +285,6 @@ class Trainer:
                     model_result = self.model(sensor_positions, samples, doa_gt)
                     doa_pred = model_result["bearings"]
 
-                    # -----------------------------------------------------
-                    # UPDATED: Extract using your specific key "sigma_i"
-                    # Shape must be: [Batch_size, Num_subarrays, Num_preds]
-                    # -----------------------------------------------------
                     # 1. Extract uncertainty (in degrees)
                     uncert_pred_deg = model_result["sigma_i"]
 
@@ -309,7 +318,8 @@ class Trainer:
         return {
             "total_loss": running_total_loss / divisor,
             "rmspe_sq": running_rmspe_sq / divisor,
-            "ue_loss": running_ue_loss / divisor
+            "ue_loss": running_ue_loss / divisor,
+            "num_sources": current_num_sources
         }
 
     def train_epoch(self):
@@ -337,12 +347,16 @@ class Trainer:
                 "batch_size": self.args.batch_size,
             }]
 
-        best_val = float("inf")
-
         # Start global epoch counter (accounts for resuming)
         global_epoch = self.start_global_epoch
 
         for stage_idx, stage_config in enumerate(stages):
+
+            # --- Reset best validation tracker for THIS stage ---
+            best_val = float("inf")
+
+            # --- Extract stage_prefix from JSON (Fallback to 'stage_1', 'stage_2', etc.) ---
+            current_stage_prefix = stage_config.get("stage_prefix", f"stage_{stage_idx + 1}")
 
             # Setup network, optimizer, and loaders for this stage
             self._setup_stage(stage_config, stage_idx)
@@ -379,10 +393,12 @@ class Trainer:
                         "val_ue_loss": val_metrics["ue_loss"],
                     })
 
-                    # --- CONVERT TO DEGREES FOR PRINTING ---
-                    # RMSPE = sqrt(mean_squared_error) * (180 / pi)
-                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"]))
-                    val_acc_deg = math.degrees(math.sqrt(val_metrics["rmspe_sq"]))
+                    # --- CONVERT TO DEGREES FOR PRINTING (USING NUM_SOURCES) ---
+                    p_train = train_metrics["num_sources"]
+                    p_val = val_metrics["num_sources"]
+
+                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"] / p_train))
+                    val_acc_deg = math.degrees(math.sqrt(val_metrics["rmspe_sq"] / p_val))
 
                     # Format strings for clean command line output
                     train_str = f"Train Loss: {train_metrics['total_loss']:.5f} (Acc: {train_acc_deg:.3f}°, UE: {train_metrics['ue_loss']:.4e})"
@@ -390,16 +406,20 @@ class Trainer:
 
                     if val_total_loss < best_val:
                         best_val = val_total_loss
-                        self._save_checkpoint(global_epoch, is_best=True)
+
+                        # Save best using the dynamic stage prefix
+                        self._save_checkpoint(global_epoch, is_best=True, stage_prefix=current_stage_prefix)
                         print(
-                            f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] *NEW BEST* | {train_str} | {val_str}")
+                            f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] *NEW BEST for {current_stage_prefix}* | {train_str} | {val_str}")
                     else:
+                        self._save_checkpoint(global_epoch, is_best=False, stage_prefix=current_stage_prefix)
                         print(f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] {train_str} | {val_str}")
                 else:
-                    self._save_checkpoint(global_epoch, is_best=False)
+                    self._save_checkpoint(global_epoch, is_best=False, stage_prefix=current_stage_prefix)
 
                     # --- CONVERT TO DEGREES FOR PRINTING (TRAIN ONLY) ---
-                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"]))
+                    p_train = train_metrics["num_sources"]
+                    train_acc_deg = math.degrees(math.sqrt(train_metrics["rmspe_sq"] / p_train))
                     train_str = f"Train Loss: {train_metrics['total_loss']:.4f} (Acc: {train_acc_deg:.2f}°, UE: {train_metrics['ue_loss']:.1e})"
 
                     print(f"[Stage {stage_idx + 1} | Global Epoch {global_epoch:03d}] {train_str}")
@@ -413,6 +433,12 @@ class Trainer:
                     )
 
                 global_epoch += 1
+            # ---------------------------------------------------------
+            # ---  Save stage checkpoint after local epochs end ---
+            # ---------------------------------------------------------
+            stage_filename = f"{current_stage_prefix}_completed"
+            self._save_checkpoint(global_epoch, is_best=False, stage_name=stage_filename)
+            print(f"\n✅ Stage {stage_idx + 1} complete. Model saved as '{stage_filename}.pth'\n")
 
         wandb.finish()
 
