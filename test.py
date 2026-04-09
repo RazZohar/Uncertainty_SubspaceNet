@@ -128,13 +128,32 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
 
                     if run_esprit:
                         # -------------------------------------------------------------
-                        # USER ESPRIT BLOCK: Call your ESPRIT and Uncertainty functions here!
+                        # USER ESPRIT BLOCK
                         # -------------------------------------------------------------
-                        # doa_pred = model.your_esprit_function(samples, num_sources)
-                        # sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False) # Or your specific func
+                        from src.models import esprit
 
-                        # (Placeholder so the script runs before you hook it up)
-                        doa_pred = torch.zeros_like(doa_gt)
+                        iq_samples = samples.squeeze(dim=2)
+                        Rx_batch_list = []
+
+                        # 1. Calculate Covariance Matrices (Rx) for all subarrays
+                        for b_idx in range(iq_samples.shape[0]):
+                            Rx = []
+                            for subarray_index in range(iq_samples.shape[1]):
+                                Rx.append(torch.cov(iq_samples[b_idx, subarray_index, :, :]))
+                            Rx_batch_list.append(torch.stack(Rx))
+                        RX_batch = torch.stack(Rx_batch_list).to(device)
+
+                        # 2. Run ESPRIT on each subarray independently
+                        doa_preds = []
+                        for subarray_index in range(iq_samples.shape[1]):
+                            subarray_Rx = RX_batch[:, subarray_index, :, :]
+                            subarray_doa = esprit(subarray_Rx, num_sources, subarray_Rx.shape[0])
+                            doa_preds.append(subarray_doa)
+
+                        # Stack back into [Batch, Subarray, Sources]
+                        doa_pred = torch.stack(doa_preds, dim=1).to(device)
+
+                        # 3. Calculate Uncertainty for Classical ESPRIT Case
                         sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
 
                         pos_pred = torch.zeros_like(source_positions)
@@ -295,9 +314,23 @@ def main(profiler=None):
         with torch.no_grad():
             if args.train_doa_only:
                 if args.esprit_baseline:
-                    # ESPRIT Call for viz
-                    # doa_pred = model.your_esprit_function(iq_samples, doa_gt.shape[-1])
-                    doa_pred = torch.zeros_like(doa_gt)
+                    from src.models import esprit
+                    iq_sq = iq_samples.squeeze(dim=2)
+                    Rx_batch_list = []
+                    for b_idx in range(iq_sq.shape[0]):
+                        Rx = []
+                        for subarray_index in range(iq_sq.shape[1]):
+                            Rx.append(torch.cov(iq_sq[b_idx, subarray_index, :, :]))
+                        Rx_batch_list.append(torch.stack(Rx))
+                    RX_batch = torch.stack(Rx_batch_list).to(device)
+
+                    doa_preds = []
+                    for subarray_index in range(iq_sq.shape[1]):
+                        subarray_Rx = RX_batch[:, subarray_index, :, :]
+                        subarray_doa = esprit(subarray_Rx, doa_gt.shape[-1], subarray_Rx.shape[0])
+                        doa_preds.append(subarray_doa)
+
+                    doa_pred = torch.stack(doa_preds, dim=1).to(device)
                     sigma_pred_deg = calculate_true_uncertainty(doa_gt, iq_samples, plot=False)
                     pos_pred = torch.zeros_like(source_pos)
                 else:
