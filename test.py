@@ -105,7 +105,7 @@ def get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad):
 
 
 @torch.no_grad()
-def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=None):
+def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=None, run_esprit=False):
     model.eval()
 
     total_total_loss = 0.0
@@ -125,16 +125,36 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
 
             if doa_only:
                 with record_function("model_forward_doa"):
-                    model_result = model(sensor_positions, samples, doa_gt)
 
-                    doa_pred = model_result["bearings"]
-                    sigma_pred_deg = model_result["sigma_i"]
+                    if run_esprit:
+                        # -------------------------------------------------------------
+                        # USER ESPRIT BLOCK: Call your ESPRIT and Uncertainty functions here!
+                        # -------------------------------------------------------------
+                        # doa_pred = model.your_esprit_function(samples, num_sources)
+                        # sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False) # Or your specific func
 
+                        # (Placeholder so the script runs before you hook it up)
+                        doa_pred = torch.zeros_like(doa_gt)
+                        sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
+
+                        pos_pred = torch.zeros_like(source_positions)
+                    else:
+                        model_result = model(sensor_positions, samples, doa_gt)
+                        doa_pred = model_result["bearings"]
+                        sigma_pred_deg = model_result["sigma_i"]
+                        if model.estimate_position:
+                            pos_pred = model_result.get("source_estimated_position", torch.zeros_like(source_positions))
+                        else:
+                            pos_pred = torch.zeros_like(source_positions)
+
+                    # 1. Get True Sigma from Rx (Always needed for Theoretical bounds)
                     sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
 
+                    # 2. Network/ESPRIT UE (Inst. Error vs Predicted Sigma)
                     sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
                     loss, rmspe_sq, net_ue_loss = criterion(sigma_pred_rad, doa_pred, doa_gt)
 
+                    # 3. Theoretical UE (Inst. Error vs True Sigma)
                     sigma_true_rad = torch.deg2rad(sigma_true_deg)
                     true_ue_loss = get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad)
 
@@ -142,16 +162,6 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     total_rmspe_sq += rmspe_sq.item()
                     total_net_ue_loss += net_ue_loss.item() if isinstance(net_ue_loss, torch.Tensor) else net_ue_loss
                     total_true_ue_loss += true_ue_loss
-
-                    if model.estimate_position is True:
-                        pos_pred = model_result["source_estimated_position"]
-                        if model.estimate_uncertainty is True:
-                            position_metrics = position_errors(
-                                model_result["source_estimated_position"],
-                                model_result["source_estimated_position_wls"],
-                                source_positions
-                            )
-                            model_result["position_metrics"] = position_metrics
 
             else:
                 with record_function("model_forward_pos"):
@@ -182,10 +192,12 @@ def main(profiler=None):
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_to_wandb", action="store_true")
 
-    # Visualization Arguments
+    # Validation/ESPRIT Arguments
+    parser.add_argument("--esprit_baseline", action="store_true", help="Run ESPRIT instead of the Neural Network")
     parser.add_argument("--visualize", action="store_true", help="Generate frame visualizations for the test set")
     parser.add_argument("--visualize_num", type=int, default=5, help="Number of samples to visualize")
     parser.add_argument("--visualize_sigma", action="store_true", help="Plot Predicted and True Sigma vs DoA")
+    parser.add_argument("--viz_prefix", type=str, default="test", help="Subfolder name for visualizations")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -213,16 +225,19 @@ def main(profiler=None):
     model.estimate_uncertainty = True
     model.estimate_position = True
 
-    checkpoint = torch.load(args.checkpoint_path, map_location=device)
-    match_learned_attn_shapes(model, checkpoint["model_state_dict"])
-    model.load_state_dict(checkpoint["model_state_dict"])
+    # Only load NN weights if we are NOT running ESPRIT
+    if not args.esprit_baseline:
+        checkpoint = torch.load(args.checkpoint_path, map_location=device)
+        match_learned_attn_shapes(model, checkpoint["model_state_dict"])
+        model.load_state_dict(checkpoint["model_state_dict"])
 
     if args.train_doa_only:
         criterion = CombinedUncertaintyLoss(lambda_val=0.5, reduction='mean')
     else:
         criterion = torch.nn.MSELoss()
 
-    if args.log_to_wandb:
+    # Disable wandb if we are running ESPRIT to avoid cluttering runs
+    if args.log_to_wandb and not args.esprit_baseline:
         wandb.init(project="multi-subarrays-doa", job_type="test")
 
     test_metrics = evaluate(
@@ -233,6 +248,7 @@ def main(profiler=None):
         batch_size=args.batch_size,
         doa_only=args.train_doa_only,
         profiler=profiler,
+        run_esprit=args.esprit_baseline
     )
 
     # ---------------------------------------------------------
@@ -240,37 +256,33 @@ def main(profiler=None):
     # ---------------------------------------------------------
     if args.train_doa_only:
         acc_deg = math.degrees(math.sqrt(test_metrics["rmspe_sq"] / test_metrics["num_sources"]))
+        title = "ESPRIT BASELINE RESULTS" if args.esprit_baseline else "TEST EVALUATION RESULTS"
 
         print(f"\n{'=' * 55}")
-        print("📊 TEST EVALUATION RESULTS")
+        print(f"📊 {title}")
         print(f"{'=' * 55}")
         print(f"Combined Total Loss      : {test_metrics['total_loss']:.6f}")
         print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°\n")
 
         print(f"Reliability (Accumulated UE Loss):")
-        print(f"  - Network UE Loss      : {test_metrics['net_ue_loss']:.3e}")
+        print(f"  - Network/ESPRIT UE Loss: {test_metrics['net_ue_loss']:.3e}")
         print(f"  - Theoretical UE Loss  : {test_metrics['true_ue_loss']:.3e}")
         print(f"{'=' * 55}\n")
 
-        if args.log_to_wandb:
+        if args.log_to_wandb and not args.esprit_baseline:
             wandb.log({
                 "test_total_loss": test_metrics["total_loss"],
                 "test_acc_degrees": acc_deg,
                 "test_network_ue_loss": test_metrics["net_ue_loss"],
                 "test_theoretical_ue_loss": test_metrics["true_ue_loss"],
             })
-    else:
-        print(f"Test Loss (MSE): {test_metrics['total_loss']:.6f}")
-        if args.log_to_wandb:
-            wandb.log({"test_loss": test_metrics["total_loss"]})
 
     # ---------------------------------------------------------
     # VISUALIZATION LOGIC
     # ---------------------------------------------------------
     if args.visualize or args.visualize_sigma:
-        print("🎨 Generating Visualizations...")
+        print(f"🎨 Generating Visualizations for {args.viz_prefix}...")
 
-        # Grab the first batch for visualization
         batch = next(iter(test_loader))
         sensor_pos, source_pos, iq_samples, doa_gt = batch
 
@@ -282,14 +294,17 @@ def main(profiler=None):
         model.eval()
         with torch.no_grad():
             if args.train_doa_only:
-                model_result = model(sensor_pos, iq_samples, doa_gt)
-                doa_pred = model_result["bearings"]
-                sigma_pred_deg = model_result["sigma_i"]
-
-                if model.estimate_position:
-                    pos_pred = model_result.get("source_estimated_position", torch.zeros_like(source_pos))
-                else:
+                if args.esprit_baseline:
+                    # ESPRIT Call for viz
+                    # doa_pred = model.your_esprit_function(iq_samples, doa_gt.shape[-1])
+                    doa_pred = torch.zeros_like(doa_gt)
+                    sigma_pred_deg = calculate_true_uncertainty(doa_gt, iq_samples, plot=False)
                     pos_pred = torch.zeros_like(source_pos)
+                else:
+                    model_result = model(sensor_pos, iq_samples, doa_gt)
+                    doa_pred = model_result["bearings"]
+                    sigma_pred_deg = model_result["sigma_i"]
+                    pos_pred = model_result.get("source_estimated_position", torch.zeros_like(source_pos))
             else:
                 pos_pred = model(sensor_pos, iq_samples, None)
                 doa_pred = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], source_pos.shape[1]).to(device)
@@ -297,12 +312,12 @@ def main(profiler=None):
 
         # --- Plot Position / DoA Frames ---
         if args.visualize:
-            os.makedirs("visualizations/test", exist_ok=True)
+            viz_dir = f"visualizations/{args.viz_prefix}"
+            os.makedirs(viz_dir, exist_ok=True)
             num_vis = min(args.visualize_num, iq_samples.shape[0])
             for sample_index in range(num_vis):
-                save_path = f"visualizations/test/test_sample_{sample_index:03d}.png"
+                save_path = f"{viz_dir}/sample_{sample_index:03d}.png"
 
-                # --- NEW: Safely get and convert sigmas to radians for visualization ---
                 current_sigmas = None
                 if sigma_pred_deg is not None:
                     current_sigmas = torch.deg2rad(sigma_pred_deg[sample_index])
@@ -312,42 +327,32 @@ def main(profiler=None):
                     bearings=doa_pred[sample_index],
                     x_hat=pos_pred[sample_index],
                     x_true=source_pos[sample_index],
-                    sigmas=current_sigmas,  # Passed in radians
+                    sigmas=current_sigmas,
                     step=0,
                     save_path=save_path
                 )
 
-                if args.log_to_wandb:
-                    wandb.log({
-                        f"test_viz/sample_{sample_index}": wandb.Image(save_path)
-                    })
-
-            print(f"✅ Saved {num_vis} frame visualizations to 'visualizations/test/'")
+            print(f"✅ Saved {num_vis} frame visualizations to '{viz_dir}/'")
 
         # --- Plot Sigma vs DoA ---
         if args.visualize_sigma and args.train_doa_only:
             print("📈 Generating Sigma vs DoA plots...")
-
-            # Calculate the True Sigma
             sigma_true_deg = calculate_true_uncertainty(doa_gt, iq_samples, plot=False)
 
             for subarray_index in range(doa_gt.shape[1]):
-                # Plot Model's Predicted Sigma
                 plot_sigma_vs_doa(
                     torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
                     sigma_pred_deg[:, subarray_index, :].cpu(),
-                    title=f"Predicted Sigma vs True DoA (Subarray {subarray_index})"
+                    title=f"[{args.viz_prefix}] Predicted Sigma vs True DoA (Subarray {subarray_index})"
                 )
-
-                # Plot True Analytical Sigma
                 plot_sigma_vs_doa(
                     torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
                     sigma_true_deg[:, subarray_index, :].cpu(),
-                    title=f"True Sigma vs True DoA (Subarray {subarray_index})"
+                    title=f"[{args.viz_prefix}] True Sigma vs True DoA (Subarray {subarray_index})"
                 )
             print("✅ Sigma plots generated.")
 
-    if args.log_to_wandb:
+    if args.log_to_wandb and not args.esprit_baseline:
         wandb.finish()
 
 
