@@ -127,15 +127,11 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                 with record_function("model_forward_doa"):
 
                     if run_esprit:
-                        # -------------------------------------------------------------
-                        # USER ESPRIT BLOCK
-                        # -------------------------------------------------------------
                         from src.models import esprit
 
                         iq_samples = samples.squeeze(dim=2)
                         Rx_batch_list = []
 
-                        # 1. Calculate Covariance Matrices (Rx) for all subarrays
                         for b_idx in range(iq_samples.shape[0]):
                             Rx = []
                             for subarray_index in range(iq_samples.shape[1]):
@@ -143,19 +139,14 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                             Rx_batch_list.append(torch.stack(Rx))
                         RX_batch = torch.stack(Rx_batch_list).to(device)
 
-                        # 2. Run ESPRIT on each subarray independently
                         doa_preds = []
                         for subarray_index in range(iq_samples.shape[1]):
                             subarray_Rx = RX_batch[:, subarray_index, :, :]
                             subarray_doa = esprit(subarray_Rx, num_sources, subarray_Rx.shape[0])
                             doa_preds.append(subarray_doa)
 
-                        # Stack back into [Batch, Subarray, Sources]
                         doa_pred = torch.stack(doa_preds, dim=1).to(device)
-
-                        # 3. Calculate Uncertainty for Classical ESPRIT Case
                         sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
-
                         pos_pred = torch.zeros_like(source_positions)
                     else:
                         model_result = model(sensor_positions, samples, doa_gt)
@@ -166,19 +157,28 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         else:
                             pos_pred = torch.zeros_like(source_positions)
 
-                    # 1. Get True Sigma from Rx (Always needed for Theoretical bounds)
                     sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
 
-                    # 2. Network/ESPRIT UE (Inst. Error vs Predicted Sigma)
+                    # Dynamic Loss function calculates values
                     sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
-                    loss, rmspe_sq, net_ue_loss = criterion(sigma_pred_rad, doa_pred, doa_gt)
+                    loss_out = criterion(sigma_pred_rad, doa_pred, doa_gt)
 
-                    # 3. Theoretical UE (Inst. Error vs True Sigma)
+                    # Handle varying outputs based on the criterion used
+                    if isinstance(loss_out, tuple) and len(loss_out) == 3:
+                        loss, rmspe_sq, net_ue_loss = loss_out
+                    elif isinstance(loss_out, tuple) and len(loss_out) == 2:
+                        loss, rmspe_sq = loss_out
+                        net_ue_loss = 0.0
+                    else:
+                        loss = loss_out
+                        rmspe_sq = loss_out  # Fallback if just MSE
+                        net_ue_loss = 0.0
+
                     sigma_true_rad = torch.deg2rad(sigma_true_deg)
                     true_ue_loss = get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad)
 
-                    total_total_loss += loss.item()
-                    total_rmspe_sq += rmspe_sq.item()
+                    total_total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
+                    total_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else rmspe_sq
                     total_net_ue_loss += net_ue_loss.item() if isinstance(net_ue_loss, torch.Tensor) else net_ue_loss
                     total_true_ue_loss += true_ue_loss
 
@@ -217,6 +217,11 @@ def main(profiler=None):
     parser.add_argument("--visualize_num", type=int, default=5, help="Number of samples to visualize")
     parser.add_argument("--visualize_sigma", action="store_true", help="Plot Predicted and True Sigma vs DoA")
     parser.add_argument("--viz_prefix", type=str, default="test", help="Subfolder name for visualizations")
+
+    # --- NEW: Dynamic Criterion Parsing ---
+    parser.add_argument("--loss_function", type=str, default="CombinedUncertaintyLoss",
+                        help="Loss Function to test with")
+    parser.add_argument("--lambda_val", type=float, default=0.5, help="Lambda value for UE Loss")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -250,12 +255,19 @@ def main(profiler=None):
         match_learned_attn_shapes(model, checkpoint["model_state_dict"])
         model.load_state_dict(checkpoint["model_state_dict"])
 
+    # --- NEW: Instantiate Correct Criterion dynamically! ---
     if args.train_doa_only:
-        criterion = CombinedUncertaintyLoss(lambda_val=0.5, reduction='mean')
+        if args.loss_function == "CombinedUncertaintyLoss":
+            criterion = CombinedUncertaintyLoss(lambda_val=args.lambda_val, reduction='mean')
+        elif args.loss_function == "RMSPELoss":
+            criterion = RMSPELoss()
+        elif args.loss_function == "MSELoss":
+            criterion = torch.nn.MSELoss()
+        else:
+            criterion = CombinedUncertaintyLoss(lambda_val=args.lambda_val, reduction='mean')  # Safe fallback
     else:
         criterion = torch.nn.MSELoss()
 
-    # Disable wandb if we are running ESPRIT to avoid cluttering runs
     if args.log_to_wandb and not args.esprit_baseline:
         wandb.init(project="multi-subarrays-doa", job_type="test")
 
@@ -278,7 +290,7 @@ def main(profiler=None):
         title = "ESPRIT BASELINE RESULTS" if args.esprit_baseline else "TEST EVALUATION RESULTS"
 
         print(f"\n{'=' * 55}")
-        print(f"📊 {title}")
+        print(f"📊 {title} (Loss: {args.loss_function})")
         print(f"{'=' * 55}")
         print(f"Combined Total Loss      : {test_metrics['total_loss']:.6f}")
         print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°\n")

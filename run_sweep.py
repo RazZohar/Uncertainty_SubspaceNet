@@ -8,7 +8,7 @@ import io
 import torch
 from contextlib import contextmanager, redirect_stdout
 
-import create_dataset_script
+import src.create_dataset_script as create_dataset_script
 import trainer
 import test
 
@@ -53,6 +53,8 @@ def parse_and_save_metrics(output_text, csv_path, param_name, param_val, eval_ta
 def main():
     parser = argparse.ArgumentParser(description="Sweep parameters and test ALL stages + ESPRIT.")
     parser.add_argument("--base_config", required=True, help="Path to base JSON config")
+    # --- NEW: Accept the stages configuration file ---
+    parser.add_argument("--stages_config", type=str, default=None, help="Path to stages JSON config")
     parser.add_argument("--param", required=True, help="Parameter to sweep (e.g., dataset.SNR)")
     parser.add_argument("--values", nargs='+', required=True, help="Values to sweep over")
     parser.add_argument("--out_dir", default="sweeps", help="Directory to store sweep results")
@@ -64,6 +66,13 @@ def main():
     base_config_path = os.path.abspath(args.base_config)
     with open(base_config_path, 'r') as f:
         base_config = json.load(f)
+
+    # Load stages config safely into memory if provided
+    stages_data = {}
+    if args.stages_config:
+        stages_config_path = os.path.abspath(args.stages_config)
+        with open(stages_config_path, 'r') as f:
+            stages_data = json.load(f)
 
     os.makedirs(args.out_dir, exist_ok=True)
     param_safe_name = args.param.replace('.', '_')
@@ -99,6 +108,13 @@ def main():
         with open(config_path, 'w') as f:
             json.dump(run_config, f, indent=4)
 
+        # Copy stages_config to the isolated directory if it exists
+        local_stages_config = None
+        if args.stages_config:
+            local_stages_config = os.path.join(run_dir, "stages_config.json")
+            with open(local_stages_config, 'w') as f:
+                json.dump(stages_data, f, indent=4)
+
         try:
             os.chdir(run_dir)
 
@@ -119,6 +135,13 @@ def main():
                 "--dataset_path", "dataset.pt",
                 "--checkpoint_dir", "."
             ]
+
+            # --- FIXED: explicitly pass stages_config to the trainer ---
+            if args.stages_config:
+                train_args.extend(["--stages_config", "stages_config.json"])
+            else:
+                train_args.extend(["--stages_config", "config.json"])  # Fallback if merged
+
             if args.doa_only: train_args.append("--train_doa_only")
 
             with patch_sys_argv(train_args):
@@ -126,21 +149,32 @@ def main():
 
             # --- 3. EVALUATE ALL TRAINED STAGES ---
             print(f"\n[3/4] Evaluating Every Neural Network Stage...")
-            stages = run_config.get("stages", [{}])
+
+            # Read stages from the correct source
+            if args.stages_config:
+                stages = stages_data.get("stages", [{}])
+            else:
+                stages = run_config.get("stages", [{}])
 
             for idx, stage in enumerate(stages):
                 stage_prefix = stage.get("stage_prefix", f"stage_{idx + 1}")
                 checkpoint_to_test = f"best_{stage_prefix}.pth"
                 viz_folder_name = f"Stage_{idx + 1}_{stage_prefix}"
 
-                print(f"\n  Testing Stage {idx + 1}: {checkpoint_to_test}")
+                # Extract stage specific criteria params
+                loss_func = stage.get("loss_function", "CombinedUncertaintyLoss")
+                l_val = stage.get("lambda_val", 0.5)
+
+                print(f"\n  Testing Stage {idx + 1}: {checkpoint_to_test} (Loss: {loss_func}, Lambda: {l_val})")
 
                 test_args = [
                     "test.py",
                     "--config_path", "config.json",
-                    "--test_dataset_path", "dataset.pt",
+                    "--test_dataset_path", "test_dataset.pt",
                     "--checkpoint_path", checkpoint_to_test,
-                    "--viz_prefix", viz_folder_name
+                    "--viz_prefix", viz_folder_name,
+                    "--loss_function", loss_func,
+                    "--lambda_val", str(l_val)
                 ]
                 if args.doa_only: test_args.append("--train_doa_only")
                 if args.visualize: test_args.append("--visualize")
@@ -158,14 +192,15 @@ def main():
             # --- 4. EVALUATE ESPRIT BASELINE ---
             print(f"\n[4/4] Evaluating ESPRIT Baseline...")
 
-            # Using the native test.py script with the ESPRIT flag!
             esprit_args = [
                 "test.py",
                 "--config_path", "config.json",
-                "--test_dataset_path", "dataset.pt",
-                "--checkpoint_path", "latest.pth",  # Irrelevant, weights won't be loaded
+                "--test_dataset_path", "test_dataset.pt",
+                "--checkpoint_path", "latest.pth",  # Irrelevant for ESPRIT
                 "--esprit_baseline",
-                "--viz_prefix", "ESPRIT_Baseline"
+                "--viz_prefix", "ESPRIT_Baseline",
+                "--loss_function", "CombinedUncertaintyLoss",
+                "--lambda_val", "1.0"
             ]
             if args.doa_only: esprit_args.append("--train_doa_only")
             if args.visualize: esprit_args.append("--visualize")
