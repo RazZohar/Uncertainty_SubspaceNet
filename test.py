@@ -142,7 +142,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         doa_preds = []
                         for subarray_index in range(iq_samples.shape[1]):
                             subarray_Rx = RX_batch[:, subarray_index, :, :]
-                            subarray_doa = esprit(subarray_Rx, num_sources, subarray_Rx.shape[0])
+                            subarray_doa, _ = esprit(subarray_Rx, num_sources, subarray_Rx.shape[0])
                             doa_preds.append(subarray_doa)
 
                         doa_pred = torch.stack(doa_preds, dim=1).to(device)
@@ -339,7 +339,7 @@ def main(profiler=None):
                     doa_preds = []
                     for subarray_index in range(iq_sq.shape[1]):
                         subarray_Rx = RX_batch[:, subarray_index, :, :]
-                        subarray_doa = esprit(subarray_Rx, doa_gt.shape[-1], subarray_Rx.shape[0])
+                        subarray_doa, _ = esprit(subarray_Rx, doa_gt.shape[-1], subarray_Rx.shape[0])
                         doa_preds.append(subarray_doa)
 
                     doa_pred = torch.stack(doa_preds, dim=1).to(device)

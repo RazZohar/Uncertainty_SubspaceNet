@@ -273,7 +273,7 @@ class Trainer:
                 sensor_positions = sensor_positions.to(self.device)
                 source_positions = source_positions.to(self.device)
                 samples = samples.to(self.device)
-                doa_gt = np.radians(doa_gt.to(self.device))
+                doa_gt = torch.deg2rad(doa_gt).to(self.device)
 
                 # Extract number of sources dynamically
                 current_num_sources = doa_gt.shape[-1]

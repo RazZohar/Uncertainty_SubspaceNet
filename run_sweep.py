@@ -25,10 +25,24 @@ def patch_sys_argv(new_argv):
 
 
 def update_nested_dict(d, keys, value):
-    """Recursively updates a nested dictionary using a list of keys."""
+    """Recursively updates a nested dictionary/list using a list of keys."""
     for key in keys[:-1]:
-        d = d.setdefault(key, {})
-    d[keys[-1]] = value
+        if isinstance(d, list):
+            # If the current object is a list, cast the key to an integer index
+            key = int(key)
+            d = d[key]
+        else:
+            # If it's a dict, traverse normally
+            if key not in d:
+                d[key] = {}
+            d = d[key]
+
+    # Apply the final value
+    last_key = keys[-1]
+    if isinstance(d, list):
+        d[int(last_key)] = value
+    else:
+        d[last_key] = value
 
 
 def parse_and_save_metrics(output_text, csv_path, param_name, param_val, eval_target):
@@ -74,9 +88,15 @@ def main():
         with open(stages_config_path, 'r') as f:
             stages_data = json.load(f)
 
-    os.makedirs(args.out_dir, exist_ok=True)
+    # --- UPDATED DIRECTORY LOGIC ---
     param_safe_name = args.param.replace('.', '_')
+
+    # Append the parameter name to the base output directory
+    args.out_dir = os.path.join(args.out_dir, f"sweep_{param_safe_name}")
+
+    os.makedirs(args.out_dir, exist_ok=True)
     summary_csv_path = os.path.abspath(os.path.join(args.out_dir, f"{param_safe_name}_sweep_results.csv"))
+    # -------------------------------
 
     with open(summary_csv_path, mode='w', newline='') as csv_file:
         writer = csv.writer(csv_file)

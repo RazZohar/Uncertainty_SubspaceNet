@@ -3,7 +3,7 @@
     {
       "name": "Stage 1: Pure Accuracy (RMSPE Only)",
       "stage_prefix": "base_accuracy",
-      "epochs": 15,
+      "epochs": 25,
       "train_scopes": ["subarray_model"],
       "train_doa_only": true,
       "loss_function": "CombinedUncertaintyLoss",
@@ -15,7 +15,7 @@
     {
       "name": "Stage 2: Introduce Reliability",
       "stage_prefix": "base_reliability",
-      "epochs": 5,
+      "epochs": 10,
       "train_scopes": ["subarray_model"],
       "train_doa_only": true,
       "loss_function": "CombinedUncertaintyLoss",
