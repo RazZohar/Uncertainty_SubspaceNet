@@ -1,3 +1,4 @@
+# ---------------- test.py ----------------
 import sys
 import os
 import math
@@ -14,6 +15,7 @@ import wandb
 
 from trainer import graph_scene_collate
 from src.multi_subarrays_model import MultiSubarraysModel
+from src.models import DeepCNN  # Imported Dynamic Model
 from src.multi_model_dataset import SensorSourceGraphDataset
 
 from src.criterions import RMSPELoss, CombinedUncertaintyLoss
@@ -35,7 +37,7 @@ from torch.profiler import (
 from src.uncertainty_block import UncertaintyEstimation
 
 
-def calculate_true_uncertainty(doa_true_rad, samples, plot=False):
+def calculate_true_uncertainty(doa_true_rad, samples, plot=False, viz_prefix=""):
     """
     Calculates the 'true' analytical uncertainty (sigma in degrees) using the covariance matrix Rx.
     """
@@ -67,15 +69,88 @@ def calculate_true_uncertainty(doa_true_rad, samples, plot=False):
             plot_sigma_vs_doa(
                 torch.rad2deg(doa_true_rad[:, index, :]).cpu(),
                 sigma_true[:, index, :].cpu(),
-                title=f"Sigma (with True Rx) vs True DoA (Subarray {index})"
+                title=f"[{viz_prefix}] Sigma (with True Rx) vs True DoA (Subarray {index})"
             )
 
     return sigma_true
 
 
+def calculate_ccrb(doa_true_rad, samples, plot=False, viz_prefix=""):
+    """
+    Calculates the Conditional Cramér-Rao Bound (CCRB) standard deviation in degrees.
+    """
+    device = doa_true_rad.device
+    iq_samples = samples.squeeze(dim=2)  # (B, S, M, N)
+    B, S, K = doa_true_rad.shape
+    M = iq_samples.shape[2]
+    N = iq_samples.shape[3]
+    d_spacing = 0.5  # Assuming half-wavelength lambda spacing for standard uniform linear arrays
+
+    # 1. Compute Rx for the batch
+    Rx_batch_list = []
+    for b_idx in range(B):
+        Rx = []
+        for s_idx in range(S):
+            Rx.append(torch.cov(iq_samples[b_idx, s_idx, :, :]))
+        Rx_batch_list.append(torch.stack(Rx))
+
+    RX_batch = torch.stack(Rx_batch_list).to(device)
+
+    # Flatten Batch and Subarray dims for vectorized matrix operations: (B*S, ...)
+    doa_flat = doa_true_rad.view(-1, K)
+    Rx_flat = RX_batch.view(-1, M, M)
+
+    m = torch.arange(M, device=device).float()
+    phases = -1j * 2 * torch.pi * d_spacing * torch.einsum('m, b k -> b m k', m, torch.sin(doa_flat))
+    A = torch.exp(phases)
+
+    D = A * (-1j * 2 * torch.pi * d_spacing * torch.einsum('m, b k -> b m k', m, torch.cos(doa_flat)))
+
+    A_H = A.conj().transpose(-2, -1)
+    A_H_A = torch.matmul(A_H, A)
+
+    A_H_A_inv = torch.linalg.pinv(A_H_A)
+    P_A = torch.matmul(A, torch.matmul(A_H_A_inv, A_H))
+
+    I = torch.eye(M, device=device, dtype=A.dtype).unsqueeze(0).expand(B * S, M, M)
+    Pi_A_perp = I - P_A
+
+    eigenvalues = torch.linalg.eigvalsh(Rx_flat)
+    noise_var = torch.mean(eigenvalues[:, :max(1, M - K)], dim=1).real
+    noise_var = torch.clamp(noise_var, min=1e-10)
+
+    A_dagger = torch.matmul(A_H_A_inv, A_H)
+    noise_mat = noise_var.view(-1, 1, 1) * I
+    Rx_clean = Rx_flat - noise_mat
+    Ps_hat = torch.matmul(A_dagger, torch.matmul(Rx_clean.to(A.dtype), A_dagger.conj().transpose(-2, -1)))
+
+    D_H = D.conj().transpose(-2, -1)
+    core_term = torch.matmul(D_H, torch.matmul(Pi_A_perp, D))
+
+    Ps_hat_T = Ps_hat.transpose(-2, -1)
+    H = (core_term * Ps_hat_T).real
+    H_inv = torch.linalg.pinv(H)
+
+    CRB = (noise_var.view(-1, 1, 1) / (2 * N)) * H_inv
+
+    crb_diag_rad2 = torch.diagonal(CRB, dim1=-2, dim2=-1)
+    crb_diag_rad2 = torch.clamp(crb_diag_rad2, min=0.0)
+    ccrb_deg = torch.rad2deg(torch.sqrt(crb_diag_rad2)).view(B, S, K)
+
+    if plot:
+        for index in range(doa_true_rad.shape[1]):
+            plot_sigma_vs_doa(
+                torch.rad2deg(doa_true_rad[:, index, :]).cpu(),
+                ccrb_deg[:, index, :].cpu(),
+                title=f"[{viz_prefix}] CCRB Sigma vs True DoA (Subarray {index})"
+            )
+
+    return ccrb_deg
+
+
 def get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad):
     """
-    Calculates the exact UE metric using the True Theoretical Sigma.
+    Calculates the exact UE metric using the given Sigma (Can be True or CCRB).
     """
     device = doa_pred.device
     B, S, P = doa_pred.shape
@@ -112,6 +187,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
     total_rmspe_sq = 0.0
     total_net_ue_loss = 0.0
     total_true_ue_loss = 0.0
+    total_ccrb_ue_loss = 0.0
+    total_ccrb_value = 0.0
     num_sources = 1
 
     for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
@@ -157,7 +234,9 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         else:
                             pos_pred = torch.zeros_like(source_positions)
 
+                    # Compute Both Baselines
                     sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
+                    ccrb_deg = calculate_ccrb(doa_gt, samples, plot=False)
 
                     # Dynamic Loss function calculates values
                     sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
@@ -174,13 +253,20 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                         rmspe_sq = loss_out  # Fallback if just MSE
                         net_ue_loss = 0.0
 
+                    # Evaluate True Variance UE Loss
                     sigma_true_rad = torch.deg2rad(sigma_true_deg)
                     true_ue_loss = get_theoretical_ue(doa_pred, doa_gt, sigma_true_rad)
+
+                    # Evaluate CCRB Variance UE Loss
+                    ccrb_rad = torch.deg2rad(ccrb_deg)
+                    ccrb_ue_loss = get_theoretical_ue(doa_pred, doa_gt, ccrb_rad)
 
                     total_total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
                     total_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else rmspe_sq
                     total_net_ue_loss += net_ue_loss.item() if isinstance(net_ue_loss, torch.Tensor) else net_ue_loss
+                    total_ccrb_value += ccrb_deg
                     total_true_ue_loss += true_ue_loss
+                    total_ccrb_ue_loss += ccrb_ue_loss
 
             else:
                 with record_function("model_forward_pos"):
@@ -197,6 +283,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
         "rmspe_sq": total_rmspe_sq / divisor,
         "net_ue_loss": total_net_ue_loss / divisor,
         "true_ue_loss": total_true_ue_loss / divisor,
+        "ccrb_value" : total_ccrb_value / divisor,
+        "ccrb_ue_loss": total_ccrb_ue_loss / divisor,
         "num_sources": num_sources
     }
 
@@ -206,6 +294,12 @@ def main(profiler=None):
     parser.add_argument("--test_dataset_path", required=True, help="Path to test dataset .pt file")
     parser.add_argument("--config_path", required=True, help="Path to YAML config file")
     parser.add_argument("--checkpoint_path", required=True, help="Path to model checkpoint")
+
+    # NEW: Model Type Selection
+    parser.add_argument("--model_type", type=str,
+                   choices=["multi_subarray", "deepcnn", "data_driven_complex"],  # <-- Added here
+                   default="multi_subarray")
+
     parser.add_argument("--train_doa_only", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=0)
@@ -218,7 +312,7 @@ def main(profiler=None):
     parser.add_argument("--visualize_sigma", action="store_true", help="Plot Predicted and True Sigma vs DoA")
     parser.add_argument("--viz_prefix", type=str, default="test", help="Subfolder name for visualizations")
 
-    # --- NEW: Dynamic Criterion Parsing ---
+    # Dynamic Criterion Parsing
     parser.add_argument("--loss_function", type=str, default="CombinedUncertaintyLoss",
                         help="Loss Function to test with")
     parser.add_argument("--lambda_val", type=float, default=0.5, help="Lambda value for UE Loss")
@@ -240,11 +334,40 @@ def main(profiler=None):
 
     sensor_positions = test_ds.get_sensor_potision()
 
-    model = MultiSubarraysModel(
-        sensors_positions=sensor_positions,
-        multi_model_configuration=args.config_path,
-        args=args
-    ).to(device)
+    # --- DYNAMIC MODEL INSTANTIATION ---
+    if args.model_type == "multi_subarray":
+        model = MultiSubarraysModel(
+            sensors_positions=sensor_positions,
+            multi_model_configuration=args.config_path,
+            args=args
+        ).to(device)
+    elif args.model_type == "deepcnn":
+
+        model = DeepCNN(
+            sensors_positions=sensor_positions,
+            multi_model_configuration=args.config_path,
+            args=args
+        ).to(device)
+        # --- ADD THIS BLOCK ---
+    elif args.model_type == "data_driven_complex":
+        from src.models import DataDrivenComplexNet
+
+        # We extract N, T, and M from the test dataset's first batch
+        # shape of iq_samples: [Batch, Subarrays, Antennas (N), Snapshots (T)]
+        M, N, T = test_ds.get_samples_shapes()
+
+        N_antennas = N
+        T_snapshots = T
+        M_sources = M
+
+        model = DataDrivenComplexNet(
+            N=N_antennas,
+            T=T_snapshots,
+            tau=8,
+            M=M_sources
+        ).to(device)
+    else:
+        raise ValueError(f"Unsupported model_type: {args.model_type}")
 
     model.estimate_uncertainty = True
     model.estimate_position = True
@@ -252,10 +375,11 @@ def main(profiler=None):
     # Only load NN weights if we are NOT running ESPRIT
     if not args.esprit_baseline:
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
-        match_learned_attn_shapes(model, checkpoint["model_state_dict"])
+        if args.model_type == "multi_subarray":
+            match_learned_attn_shapes(model, checkpoint["model_state_dict"])
         model.load_state_dict(checkpoint["model_state_dict"])
 
-    # --- NEW: Instantiate Correct Criterion dynamically! ---
+    # --- Instantiate Correct Criterion dynamically ---
     if args.train_doa_only:
         if args.loss_function == "CombinedUncertaintyLoss":
             criterion = CombinedUncertaintyLoss(lambda_val=args.lambda_val, reduction='mean')
@@ -287,7 +411,7 @@ def main(profiler=None):
     # ---------------------------------------------------------
     if args.train_doa_only:
         acc_deg = math.degrees(math.sqrt(test_metrics["rmspe_sq"] / test_metrics["num_sources"]))
-        title = "ESPRIT BASELINE RESULTS" if args.esprit_baseline else "TEST EVALUATION RESULTS"
+        title = "ESPRIT BASELINE RESULTS" if args.esprit_baseline else f"TEST EVALUATION RESULTS ({args.model_type.upper()})"
 
         print(f"\n{'=' * 55}")
         print(f"📊 {title} (Loss: {args.loss_function})")
@@ -296,8 +420,10 @@ def main(profiler=None):
         print(f"DOA Accuracy (Avg/Src)   : {acc_deg:.3f}°\n")
 
         print(f"Reliability (Accumulated UE Loss):")
+        print(f"  - CCRB : {test_metrics['ccrb_value']:.3e}")
         print(f"  - Network/ESPRIT UE Loss: {test_metrics['net_ue_loss']:.3e}")
         print(f"  - Theoretical UE Loss  : {test_metrics['true_ue_loss']:.3e}")
+        print(f"  - CCRB UE Loss         : {test_metrics['ccrb_ue_loss']:.3e}")
         print(f"{'=' * 55}\n")
 
         if args.log_to_wandb and not args.esprit_baseline:
@@ -306,6 +432,7 @@ def main(profiler=None):
                 "test_acc_degrees": acc_deg,
                 "test_network_ue_loss": test_metrics["net_ue_loss"],
                 "test_theoretical_ue_loss": test_metrics["true_ue_loss"],
+                "test_ccrb_ue_loss": test_metrics["ccrb_ue_loss"],
             })
 
     # ---------------------------------------------------------
@@ -381,8 +508,11 @@ def main(profiler=None):
 
         # --- Plot Sigma vs DoA ---
         if args.visualize_sigma and args.train_doa_only:
-            print("📈 Generating Sigma vs DoA plots...")
+            print("📈 Generating Sigma vs DoA plots for all uncertainties...")
+
+            # Compute both baselines for plotting
             sigma_true_deg = calculate_true_uncertainty(doa_gt, iq_samples, plot=False)
+            ccrb_deg = calculate_ccrb(doa_gt, iq_samples, plot=False)
 
             for subarray_index in range(doa_gt.shape[1]):
                 plot_sigma_vs_doa(
@@ -394,6 +524,11 @@ def main(profiler=None):
                     torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
                     sigma_true_deg[:, subarray_index, :].cpu(),
                     title=f"[{args.viz_prefix}] True Sigma vs True DoA (Subarray {subarray_index})"
+                )
+                plot_sigma_vs_doa(
+                    torch.rad2deg(doa_gt[:, subarray_index, :]).cpu(),
+                    ccrb_deg[:, subarray_index, :].cpu(),
+                    title=f"[{args.viz_prefix}] CCRB Sigma vs True DoA (Subarray {subarray_index})"
                 )
             print("✅ Sigma plots generated.")
 

@@ -456,6 +456,12 @@ class SensorSourceGraphDataset(Dataset):
 
         return new_samples
 
+    def get_samples_shapes(self):
+        M, N, T = self.__system_model_params.M, self.__system_model_params.N, self.__system_model_params.T
+
+        return (M, N, T)
+
+
 
 def set_dataset_filename(system_model_params: SystemModelParams, samples_size: float):
     """Returns the generic suffix of the datasets filename.

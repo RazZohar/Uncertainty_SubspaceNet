@@ -1,4 +1,4 @@
-# ---------------- main.py ----------------
+# ---------------- trainer.py ----------------
 """
 Full trainer revised: Supports multi-stage training curricula via a JSON configuration.
 Properly handles dynamic parameter freezing/unfreezing and tracks continuous
@@ -31,6 +31,7 @@ from src.multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 from src.system_model import SystemModelParams
 from src.models import ModelGenerator
 from src.criterions import RMSPELoss
+from src.models import DeepCNN
 
 # If you implemented UEELoss, you can import it here
 from src.criterions import UEELoss, CombinedUncertaintyLoss
@@ -212,11 +213,22 @@ class Trainer:
             raise ValueError("Sensors Position Not Found")
 
     def _build_model(self):
-        return MultiSubarraysModel(
-            sensors_positions=self._extract_sensor_positions(),
-            multi_model_configuration=self.args.config_path,
-            args=self.args
-        )
+        if self.args.model_type == "multi_subarray":
+            return MultiSubarraysModel(
+                sensors_positions=self._extract_sensor_positions(),
+                multi_model_configuration=self.args.config_path,
+                args=self.args
+            )
+        elif self.args.model_type == "data_driven_complex":
+            from src.models import DataDrivenComplexNet  # Ensure the import path is correct
+            return DataDrivenComplexNet(
+                N=self.args.num_antennas,
+                T=self.args.num_snapshots,
+                tau=8,
+                M=self.args.num_sources
+            )
+        else:
+            raise ValueError(f"Unsupported model_type: {self.args.model_type}")
 
     def _load_checkpoint(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -512,6 +524,13 @@ def parse_args():
     p.add_argument("--stages_config", type=str, default=None, help="Path to JSON file defining training stages")
     p.add_argument("--val_split", type=float, default=0.1, help="Fraction of data held out for validation")
     p.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+
+
+    # select from multiple models avaliable
+    p.add_argument("--model_type", type=str,
+                        choices=["multi_subarray", "deepcnn", "data_driven_complex"], # <-- Added new model
+                        default="multi_subarray",
+                        help="Which model architecture to instantiate and train")
 
     # Training hyper‑params (Act as default fallbacks if not in stages config)
     p.add_argument("--train_doa_only", action="store_true", default=False)
