@@ -13,7 +13,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 import wandb
 
-from trainer import graph_scene_collate
+from trainer import graph_scene_collate, infer_dataset_dimensions, import_transmusic, get_wandb_prefix
 from src.multi_subarrays_model import MultiSubarraysModel
 from src.models import DeepCNN  # Imported Dynamic Model
 from src.multi_model_dataset import SensorSourceGraphDataset
@@ -238,20 +238,25 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     sigma_true_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
                     ccrb_deg = calculate_ccrb(doa_gt, samples, plot=False)
 
-                    # Dynamic Loss function calculates values
+                    # Dynamic loss function calculates values.
                     sigma_pred_rad = torch.deg2rad(sigma_pred_deg)
-                    loss_out = criterion(sigma_pred_rad, doa_pred, doa_gt)
-
-                    # Handle varying outputs based on the criterion used
-                    if isinstance(loss_out, tuple) and len(loss_out) == 3:
-                        loss, rmspe_sq, net_ue_loss = loss_out
-                    elif isinstance(loss_out, tuple) and len(loss_out) == 2:
-                        loss, rmspe_sq = loss_out
+                    if isinstance(criterion, torch.nn.MSELoss):
+                        loss = criterion(doa_pred, doa_gt)
+                        rmspe_sq = loss.detach()
                         net_ue_loss = 0.0
                     else:
-                        loss = loss_out
-                        rmspe_sq = loss_out  # Fallback if just MSE
-                        net_ue_loss = 0.0
+                        loss_out = criterion(sigma_pred_rad, doa_pred, doa_gt)
+
+                        # Handle varying outputs based on the criterion used
+                        if isinstance(loss_out, tuple) and len(loss_out) == 3:
+                            loss, rmspe_sq, net_ue_loss = loss_out
+                        elif isinstance(loss_out, tuple) and len(loss_out) == 2:
+                            loss, rmspe_sq = loss_out
+                            net_ue_loss = 0.0
+                        else:
+                            loss = loss_out
+                            rmspe_sq = loss_out  # Fallback if just scalar loss
+                            net_ue_loss = 0.0
 
                     # Evaluate True Variance UE Loss
                     sigma_true_rad = torch.deg2rad(sigma_true_deg)
@@ -264,7 +269,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     total_total_loss += loss.item() if isinstance(loss, torch.Tensor) else loss
                     total_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else rmspe_sq
                     total_net_ue_loss += net_ue_loss.item() if isinstance(net_ue_loss, torch.Tensor) else net_ue_loss
-                    total_ccrb_value += ccrb_deg
+                    total_ccrb_value += ccrb_deg.mean().item()
                     total_true_ue_loss += true_ue_loss
                     total_ccrb_ue_loss += ccrb_ue_loss
 
@@ -297,13 +302,20 @@ def main(profiler=None):
 
     # NEW: Model Type Selection
     parser.add_argument("--model_type", type=str,
-                   choices=["multi_subarray", "deepcnn", "data_driven_complex"],  # <-- Added here
+                   choices=["multi_subarray", "data_driven_complex", "transmusic", "deepcnn"],
                    default="multi_subarray")
 
     parser.add_argument("--train_doa_only", action="store_true")
     parser.add_argument("--batch_size", type=int, default=1024)
     parser.add_argument("--num_workers", type=int, default=0)
     parser.add_argument("--log_to_wandb", action="store_true")
+    parser.add_argument("--wandb_name_prefix", type=str, default=None,
+                        help="Optional W&B run-name prefix. Defaults to a stable prefix per model type.")
+    parser.add_argument("--wandb_project", type=str, default="multi-subarrays-doa",
+                        help="W&B project name")
+    parser.add_argument("--tau", type=int, default=8, help="Lag/latent parameter for data-driven complex model")
+    parser.add_argument("--num_angle_bins", type=int, default=360, help="Angle grid size for TransMUSIC/DeepCNN")
+    parser.add_argument("--d_spacing", type=float, default=0.5, help="ULA spacing in wavelengths for TransMUSIC")
 
     # Validation/ESPRIT Arguments
     parser.add_argument("--esprit_baseline", action="store_true", help="Run ESPRIT instead of the Neural Network")
@@ -339,38 +351,34 @@ def main(profiler=None):
         model = MultiSubarraysModel(
             sensors_positions=sensor_positions,
             multi_model_configuration=args.config_path,
-            args=args
-        ).to(device)
-    elif args.model_type == "deepcnn":
-
-        model = DeepCNN(
-            sensors_positions=sensor_positions,
-            multi_model_configuration=args.config_path,
-            args=args
-        ).to(device)
-        # --- ADD THIS BLOCK ---
-    elif args.model_type == "data_driven_complex":
-        from src.models import DataDrivenComplexNet
-
-        # We extract N, T, and M from the test dataset's first batch
-        # shape of iq_samples: [Batch, Subarrays, Antennas (N), Snapshots (T)]
-        M, N, T = test_ds.get_samples_shapes()
-
-        N_antennas = N
-        T_snapshots = T
-        M_sources = M
-
-        model = DataDrivenComplexNet(
-            N=N_antennas,
-            T=T_snapshots,
-            tau=8,
-            M=M_sources
+            args=args,
         ).to(device)
     else:
-        raise ValueError(f"Unsupported model_type: {args.model_type}")
+        num_antennas, num_snapshots, num_sources = infer_dataset_dimensions(test_ds)
+
+        if args.model_type == "data_driven_complex":
+            from src.models import DataDrivenComplexNet
+            model = DataDrivenComplexNet(
+                N=num_antennas,
+                T=num_snapshots,
+                tau=8,
+                M=num_sources,
+            ).to(device)
+        elif args.model_type == "transmusic":
+            TransMUSIC = import_transmusic()
+            model = TransMUSIC(
+                num_antennas=num_antennas,
+                num_sources=num_sources,
+                num_angle_bins=args.num_angle_bins,
+                d_spacing=args.d_spacing,
+            ).to(device)
+        elif args.model_type == "deepcnn":
+            model = DeepCNN(N=num_antennas, grid_size=args.num_angle_bins).to(device)
+        else:
+            raise ValueError(f"Unsupported model_type: {args.model_type}")
 
     model.estimate_uncertainty = True
-    model.estimate_position = True
+    model.estimate_position = False if args.model_type in {"data_driven_complex", "transmusic", "deepcnn"} else True
 
     # Only load NN weights if we are NOT running ESPRIT
     if not args.esprit_baseline:
@@ -393,7 +401,13 @@ def main(profiler=None):
         criterion = torch.nn.MSELoss()
 
     if args.log_to_wandb and not args.esprit_baseline:
-        wandb.init(project="multi-subarrays-doa", job_type="test")
+        wandb_prefix = get_wandb_prefix(args)
+        wandb.init(
+            project=args.wandb_project,
+            job_type="test",
+            name=f"{wandb_prefix}_test_{args.viz_prefix}",
+            tags=[args.model_type, wandb_prefix],
+        )
 
     test_metrics = evaluate(
         model,

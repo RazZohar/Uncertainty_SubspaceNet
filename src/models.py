@@ -1277,24 +1277,31 @@ class DeepCNN(nn.Module):
 
 
 class DataDrivenComplexNet(nn.Module):
+    """
+    Pure data-driven complex network benchmark.
+
+    The original forward path assumed one subarray and a 4-D input.  For the
+    benchmarking sweep we keep the same external contract as MultiSubarraysModel
+    and TransMUSIC: input samples may be either [B, S, R, N, T], [B, S, N, T],
+    or [B, N, T], and the output is always [B, S, M].
+    """
+
     def __init__(self, N: int, T: int, tau: int, M: int, quantize_source=False, codebook_size=256):
         super(DataDrivenComplexNet, self).__init__()
         self.quantize_source = quantize_source
 
-        self.N = N
-        self.T = T
-        self.M = M
+        self.N = int(N)
+        self.T = int(T)
+        self.M = int(M)
         self.batch_size = 1  # Set dynamically in forward
 
-        in_channels = 8
-        out_channels = 8
+        in_channels = self.N
+        out_channels = self.N
 
         # --------------------------------------------------
-        # 1. Your Custom Complex DCNN Layers
+        # 1. Custom Complex DCNN Layers
         # --------------------------------------------------
-        # Assuming ComplexReLU, AntiRectifierLayer, ComplexConv1d, ComplexConvTranspose1d are imported
-
-        self.complex_rectifier = ComplexReLU(self.anti_rectifier)  # Ensure self.anti_rectifier is defined
+        self.complex_rectifier = ComplexReLU(self.anti_rectifier)
         self.anti_rectifier_layer = AntiRectifierLayer(self.complex_rectifier)
 
         self.conv1 = ComplexConv1d(in_channels, 16, kernel_size=2)
@@ -1305,33 +1312,23 @@ class DataDrivenComplexNet(nn.Module):
         self.deconv3 = ComplexConvTranspose1d(64, 16, kernel_size=2)
         self.deconv4 = ComplexConvTranspose1d(32, out_channels, kernel_size=2)
 
-        # ENCODER
         self.encoder_signal = nn.Sequential(
             self.conv1,
-            self.anti_rectifier_layer,  # Assuming this doubles channels (16 -> 32)
+            self.anti_rectifier_layer,
             self.conv2,
-            self.anti_rectifier_layer,  # (32 -> 64)
+            self.anti_rectifier_layer,
             self.conv3,
-            self.anti_rectifier_layer  # (64 -> 128)
+            self.anti_rectifier_layer,
         )
 
-        # DECODER
         self.decoder_signal = nn.Sequential(
             self.deconv2,
-            self.anti_rectifier_layer,  # (32 -> 64)
+            self.anti_rectifier_layer,
             self.deconv3,
-            self.anti_rectifier_layer,  # (16 -> 32)
-            self.deconv4
+            self.anti_rectifier_layer,
+            self.deconv4,
         )
 
-        # --------------------------------------------------
-        # 2. Dual Heads (Data-Driven DoA & Uncertainty)
-        # --------------------------------------------------
-        # We need to calculate the flattened dimension.
-        # Output of deconv4 has 'out_channels' (8).
-        # Assuming sequence length T is roughly preserved, the flattened size is:
-        # out_channels * T * 2 (because we concatenate Real and Imaginary parts).
-        # Note: If your conv/deconv kernels change T, adjust `self.T_out` accordingly!
         self.T_out = self.T
         flattened_dim = out_channels * self.T_out * 2
 
@@ -1341,7 +1338,7 @@ class DataDrivenComplexNet(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, self.M)  # Output M angles
+            nn.Linear(128, self.M),
         )
 
         self.uncertainty_head = nn.Sequential(
@@ -1350,49 +1347,59 @@ class DataDrivenComplexNet(nn.Module):
             nn.Dropout(0.2),
             nn.Linear(256, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(128, self.M),  # Output standard deviation per source
-            nn.Softplus()  # Enforces strictly positive values (degrees)
+            nn.Linear(128, self.M),
+            nn.Softplus(),
         )
+
+    @staticmethod
+    def _prepare_samples(samples: torch.Tensor) -> torch.Tensor:
+        """Return complex IQ samples as [B, S, N, T]."""
+        if samples.dim() == 5:
+            # Dataset convention: [B, S, samples_per_subarray, N, T]
+            return samples[:, :, 0, :, :]
+        if samples.dim() == 4:
+            # Already [B, S, N, T]
+            return samples
+        if samples.dim() == 3:
+            # Single subarray: [B, N, T]
+            return samples.unsqueeze(1)
+        raise ValueError(f"Unsupported samples shape for DataDrivenComplexNet: {tuple(samples.shape)}")
+
+    def anti_rectifier(self, X):
+        return torch.cat((torch.relu(X), torch.relu(-X)), dim=1)
 
     def forward(self, sensor_positions, samples, doa_gt=None):
         """
-        Forward Pass compatible with other models and trainer script
+        Trainer-compatible forward pass.
+
         Args:
-            sensor_positions: [Batch, Subarrays, Antennas, 2] (Ignored for this specific network)
-            samples: Complex IQ tensor of shape [Batch, Subarrays, Antennas, Snapshots]
-            doa_gt: Ground truth angles (Ignored during forward pass)
+            sensor_positions: ignored by this benchmark model.
+            samples: complex IQ samples shaped [B, S, R, N, T], [B, S, N, T], or [B, N, T].
+            doa_gt: ignored during forward pass.
         """
-        # Squeeze out the Subarray dimension if it exists (assuming 1 subarray for this model)
-        # Changes shape from [Batch, 1, 8, T] -> [Batch, 8, T]
-        if len(samples.shape) == 4:
-            x = samples.squeeze(dim=1)
-        else:
-            x = samples
+        x = self._prepare_samples(samples)
+        B, S, N, T = x.shape
+        if N != self.N:
+            raise ValueError(f"DataDrivenComplexNet expected N={self.N} antennas, got N={N}.")
+        if T != self.T:
+            raise ValueError(f"DataDrivenComplexNet expected T={self.T} snapshots, got T={T}.")
 
-        self.batch_size = x.shape[0]
+        x = x.reshape(B * S, N, T)
+        self.batch_size = B * S
 
-        # --- 1. Complex Feature Extraction ---
         encoded = self.encoder_signal(x)
         decoded = self.decoder_signal(encoded)
 
-        # --- 2. Bridge Complex to Real Domain ---
-        x_real = decoded.real.view(self.batch_size, -1)
-        x_imag = decoded.imag.view(self.batch_size, -1)
-
+        x_real = decoded.real.reshape(self.batch_size, -1)
+        x_imag = decoded.imag.reshape(self.batch_size, -1)
         x_flat = torch.cat([x_real, x_imag], dim=1).float()
 
-        # --- 3. Purely Data-Driven Predictions ---
-        doa_pred = self.doa_head(x_flat)
-        sigma_pred = self.uncertainty_head(x_flat) + 1e-4
-
-        # In trainer.py, the DoA output needs an extra dimension for Subarrays
-        # to match [Batch, Subarrays, Sources]. We unsqueeze it to [Batch, 1, Sources]
-        doa_pred = doa_pred.unsqueeze(1)
-        sigma_pred = sigma_pred.unsqueeze(1)
+        doa_pred = self.doa_head(x_flat).reshape(B, S, self.M)
+        sigma_pred = (self.uncertainty_head(x_flat) + 1e-4).reshape(B, S, self.M)
 
         return {
             "bearings": doa_pred,
-            "sigma_i": sigma_pred
+            "sigma_i": sigma_pred,
         }
 
 

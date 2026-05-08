@@ -32,9 +32,67 @@ from src.system_model import SystemModelParams
 from src.models import ModelGenerator
 from src.criterions import RMSPELoss
 from src.models import DeepCNN
+from src.transmusic import TransMUSIC
 
 # If you implemented UEELoss, you can import it here
 from src.criterions import UEELoss, CombinedUncertaintyLoss
+
+
+MODEL_WANDB_PREFIXES = {
+    "multi_subarray": "my_model",
+    "data_driven_complex": "data_driven",
+    "transmusic": "transmusic",
+    "deepcnn": "deepcnn",
+}
+
+
+def get_wandb_prefix(args) -> str:
+    return args.wandb_name_prefix or MODEL_WANDB_PREFIXES.get(args.model_type, args.model_type)
+
+
+def import_transmusic():
+    from src.transmusic import TransMUSIC
+    return TransMUSIC
+
+
+def infer_dataset_dimensions(dataset):
+    """
+    Infer (num_antennas, num_snapshots, num_sources) from the dataset.
+
+    Supports the current SensorSourceGraphDataset convention where a single item
+    stores IQ as [subarrays, samples_per_subarray, antennas, snapshots], and also
+    supports [subarrays, antennas, snapshots] and [antennas, snapshots].
+    """
+    if hasattr(dataset, "get_samples_shapes"):
+        try:
+            num_sources, num_antennas, num_snapshots = dataset.get_samples_shapes()
+            return int(num_antennas), int(num_snapshots), int(num_sources)
+        except Exception:
+            pass
+
+    _, source_positions, samples, doa_stacks = dataset[0]
+    if not torch.is_tensor(samples):
+        samples = torch.as_tensor(samples)
+    if not torch.is_tensor(doa_stacks):
+        doa_stacks = torch.as_tensor(doa_stacks)
+
+    if samples.dim() == 4:
+        # [S, R, N, T]
+        num_antennas = samples.shape[-2]
+        num_snapshots = samples.shape[-1]
+    elif samples.dim() == 3:
+        # [S, N, T]
+        num_antennas = samples.shape[-2]
+        num_snapshots = samples.shape[-1]
+    elif samples.dim() == 2:
+        # [N, T]
+        num_antennas = samples.shape[-2]
+        num_snapshots = samples.shape[-1]
+    else:
+        raise ValueError(f"Cannot infer sample dimensions from shape {tuple(samples.shape)}")
+
+    num_sources = int(doa_stacks.shape[-1]) if doa_stacks.dim() > 0 else int(source_positions.shape[0])
+    return int(num_antennas), int(num_snapshots), int(num_sources)
 
 
 # -----------------------------------------------------------------------------
@@ -68,10 +126,12 @@ class Trainer:
             torch.cuda.manual_seed_all(args.seed)
 
         # ---------------- WandB ----------------
+        self.wandb_prefix = get_wandb_prefix(args)
         wandb.init(
-            project="multi-subarrays-doa",
+            project=args.wandb_project,
             config=vars(args),
-            name=f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            name=f"{self.wandb_prefix}_train_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+            tags=[args.model_type, self.wandb_prefix],
         )
 
         # ---------------- Dataset ----------------
@@ -217,18 +277,33 @@ class Trainer:
             return MultiSubarraysModel(
                 sensors_positions=self._extract_sensor_positions(),
                 multi_model_configuration=self.args.config_path,
-                args=self.args
+                args=self.args,
             )
-        elif self.args.model_type == "data_driven_complex":
-            from src.models import DataDrivenComplexNet  # Ensure the import path is correct
+
+        num_antennas, num_snapshots, num_sources = infer_dataset_dimensions(self.train_ds.dataset)
+
+        if self.args.model_type == "data_driven_complex":
+            from src.models import DataDrivenComplexNet
             return DataDrivenComplexNet(
-                N=self.args.num_antennas,
-                T=self.args.num_snapshots,
-                tau=8,
-                M=self.args.num_sources
+                N=num_antennas,
+                T=num_snapshots,
+                tau=self.args.tau,
+                M=num_sources,
             )
-        else:
-            raise ValueError(f"Unsupported model_type: {self.args.model_type}")
+
+        if self.args.model_type == "transmusic":
+            TransMUSIC = import_transmusic()
+            return TransMUSIC(
+                num_antennas=num_antennas,
+                num_sources=num_sources,
+                num_angle_bins=self.args.num_angle_bins,
+                d_spacing=self.args.d_spacing,
+            )
+
+        if self.args.model_type == "deepcnn":
+            return DeepCNN(N=num_antennas, grid_size=self.args.num_angle_bins)
+
+        raise ValueError(f"Unsupported model_type: {self.args.model_type}")
 
     def _load_checkpoint(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location="cpu")
@@ -241,6 +316,8 @@ class Trainer:
                          stage_prefix: str = None):
         ckpt = {
             "global_epoch": global_epoch,
+            "model_type": self.args.model_type,
+            "wandb_prefix": self.wandb_prefix,
             "model_state_dict": self.model.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
             "scheduler_state_dict": self.scheduler.state_dict(),
@@ -303,12 +380,28 @@ class Trainer:
                     # 2. MATCH UNITS: Convert to radians so the loss math works!
                     uncert_pred_rad = torch.deg2rad(uncert_pred_deg)
 
-                    # 3. Calculate combined loss and individual metrics in pure radians
-                    loss, rmspe_sq, ue_loss = self.criterion(uncert_pred_rad, doa_pred, doa_gt)
+                    # 3. Calculate loss and individual metrics in pure radians.
+                    # CombinedUncertaintyLoss returns (loss, rmspe_sq, ue_loss),
+                    # while RMSPE/MSE-style losses may return fewer values.
+                    if isinstance(self.criterion, nn.MSELoss):
+                        loss = self.criterion(doa_pred, doa_gt)
+                        rmspe_sq = loss.detach()
+                        ue_loss = torch.zeros((), device=self.device)
+                    else:
+                        loss_out = self.criterion(uncert_pred_rad, doa_pred, doa_gt)
+                        if isinstance(loss_out, tuple) and len(loss_out) == 3:
+                            loss, rmspe_sq, ue_loss = loss_out
+                        elif isinstance(loss_out, tuple) and len(loss_out) == 2:
+                            loss, rmspe_sq = loss_out
+                            ue_loss = torch.zeros((), device=self.device)
+                        else:
+                            loss = loss_out
+                            rmspe_sq = loss_out.detach() if isinstance(loss_out, torch.Tensor) else torch.tensor(loss_out, device=self.device)
+                            ue_loss = torch.zeros((), device=self.device)
 
                     # Accumulate for logging
-                    running_rmspe_sq += rmspe_sq.item()
-                    running_ue_loss += ue_loss.item()
+                    running_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else float(rmspe_sq)
+                    running_ue_loss += ue_loss.item() if isinstance(ue_loss, torch.Tensor) else float(ue_loss)
                 else:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
                     loss = self.criterion(pos_pred, source_positions.squeeze(-2))
@@ -528,9 +621,16 @@ def parse_args():
 
     # select from multiple models avaliable
     p.add_argument("--model_type", type=str,
-                        choices=["multi_subarray", "deepcnn", "data_driven_complex"], # <-- Added new model
+                        choices=["multi_subarray", "data_driven_complex", "transmusic", "deepcnn"],
                         default="multi_subarray",
                         help="Which model architecture to instantiate and train")
+    p.add_argument("--wandb_name_prefix", type=str, default=None,
+                   help="Optional W&B run-name prefix. Defaults to a stable prefix per model type.")
+    p.add_argument("--wandb_project", type=str, default="multi-subarrays-doa",
+                   help="W&B project name")
+    p.add_argument("--tau", type=int, default=8, help="Lag/latent parameter for data-driven complex model")
+    p.add_argument("--num_angle_bins", type=int, default=360, help="Angle grid size for TransMUSIC/DeepCNN")
+    p.add_argument("--d_spacing", type=float, default=0.5, help="ULA spacing in wavelengths for TransMUSIC")
 
     # Training hyper‑params (Act as default fallbacks if not in stages config)
     p.add_argument("--train_doa_only", action="store_true", default=False)
