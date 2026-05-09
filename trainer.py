@@ -31,11 +31,11 @@ from src.multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
 from src.system_model import SystemModelParams
 from src.models import ModelGenerator
 from src.criterions import RMSPELoss
-from src.models import DeepCNN
-from src.transmusic import TransMUSIC
+from src.models import DeepCNN, DataDrivenComplexNet
 
 # If you implemented UEELoss, you can import it here
 from src.criterions import UEELoss, CombinedUncertaintyLoss
+from src.transmusic import TransMUSIC
 
 
 MODEL_WANDB_PREFIXES = {
@@ -52,6 +52,7 @@ def get_wandb_prefix(args) -> str:
 
 def import_transmusic():
     from src.transmusic import TransMUSIC
+
     return TransMUSIC
 
 
@@ -239,31 +240,57 @@ class Trainer:
 
     def _configure_trainable_params(self):
         """
-        Dynamically freezes/unfreezes model parameters based on self.current_train_scopes.
+        Dynamically freezes/unfreezes model parameters.
+
+        Important benchmarking rule:
+        train_scopes from the multi-subarray staged curriculum are meaningful only
+        for the multi_subarray model, because scopes such as ``subarray_models`` or
+        ``learned_attentaion`` do not exist in TransMUSIC/DataDriven baselines.
+        For baseline models, ignore non-None stage scopes and train the full model.
         """
-        # Freeze everything first to ensure a clean slate
+        scopes = self.current_train_scopes
+
+        # Baseline models should not inherit the multi-subarray curriculum scopes.
+        # Otherwise no parameter names match, and the optimizer receives an empty
+        # parameter list.
+        if self.args.model_type in {"data_driven_complex", "transmusic", "deepcnn"}:
+            if scopes is not None:
+                print(
+                    f"   * Ignoring train_scopes={scopes} for "
+                    f"model_type={self.args.model_type}; training full model."
+                )
+            scopes = None
+
+        # Freeze everything first to ensure a clean slate.
         for p in self.model.parameters():
             p.requires_grad = False
 
-        scopes = self.current_train_scopes
-
         if scopes is None:
-            # If no scopes provided, unfreeze everything
+            # If no scopes provided, unfreeze everything.
             for p in self.model.parameters():
                 p.requires_grad = True
             print("   * Trainable Scopes: ALL (Full Model Unfrozen)")
         else:
-            # Unfreeze only the requested scopes
+            # Unfreeze only the requested scopes.
             for name, p in self.model.named_parameters():
                 if any(scope in name for scope in scopes):
                     p.requires_grad = True
             print(f"   * Trainable Scopes: {scopes}")
 
-        # Build the final list of parameters that the optimizer should track
+        # Build the final list of parameters that the optimizer should track.
         self.trainable_params = [p for p in self.model.parameters() if p.requires_grad]
 
         if not self.trainable_params:
-            raise ValueError(f"No parameters matched train_scopes={scopes}.")
+            available_names = [name for name, _ in self.model.named_parameters()]
+            preview = available_names[:20]
+            raise ValueError(
+                f"No parameters matched train_scopes={scopes} for "
+                f"model_type={self.args.model_type}. "
+                f"First available parameter names: {preview}"
+            )
+
+        total_trainable = sum(p.numel() for p in self.trainable_params)
+        print(f"   * Trainable Parameters: {total_trainable:,}")
 
     def _extract_sensor_positions(self):
         sensor_positions = self.train_ds.dataset.get_sensor_potision()
