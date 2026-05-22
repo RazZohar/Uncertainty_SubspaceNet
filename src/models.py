@@ -830,7 +830,14 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
                 return doa_prediction, doa_all_predictions, roots, Rz, vq_loss
                 """
         # Feed surrogate covariance to Esprit algorithm
-        doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
+        #doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
+        doa_prediction, estimated_subspace = esprit_batched(
+            Rz,
+            self.M,
+            use_eigh=True,
+            sort_doa=False,
+        )
+
         return Rz, doa_prediction
 
     def sense_device_forward(self, x):
@@ -1468,6 +1475,115 @@ def root_music(Rz: torch.Tensor, M: int, batch_size: int):
         roots_to_return,
     ), subspace_batches
 
+
+
+
+
+def esprit_batched(
+    Rz: torch.Tensor,
+    M: int,
+    batch_size: int = None,
+    *,
+    use_eigh: bool = True,
+    sort_doa: bool = False,
+    clamp_eps: float = 1e-7,
+):
+    """
+    Batched PyTorch ESPRIT.
+
+    Args:
+        Rz:
+            Surrogate covariance matrix, shape [B, N, N].
+            N = number of array elements.
+        M:
+            Number of sources.
+        batch_size:
+            Kept only for backward compatibility. Not used.
+        use_eigh:
+            True is recommended if Rz is Hermitian covariance.
+            False uses torch.linalg.eig, closer to your original code.
+        sort_doa:
+            If True, sorts DOAs per batch. If your outer model already sorts bearings,
+            keep this False.
+        clamp_eps:
+            Clamp for arcsin input to avoid NaNs.
+
+    Returns:
+        doa_predictions:
+            [B, M], radians.
+        subspace_info:
+            dict with batched eigenvalues/eigenvectors.
+    """
+
+    if Rz.ndim != 3:
+        raise ValueError(f"Rz must have shape [B, N, N], got {tuple(Rz.shape)}")
+
+    B, N, N2 = Rz.shape
+    if N != N2:
+        raise ValueError(f"Rz must be square, got {tuple(Rz.shape)}")
+
+    if M <= 0 or M >= N:
+        raise ValueError(f"M must satisfy 0 < M < N. Got M={M}, N={N}")
+
+    # Covariance should be Hermitian. This improves numerical stability.
+    if use_eigh:
+        Rz_h = 0.5 * (Rz + Rz.conj().transpose(-1, -2))
+
+        # Batched Hermitian EVD.
+        # eigenvalues:  [B, N], ascending
+        # eigenvectors: [B, N, N]
+        eigenvalues, eigenvectors = torch.linalg.eigh(Rz_h)
+
+        # Signal subspace: eigenvectors of the largest M eigenvalues.
+        Us = eigenvectors[:, :, -M:]  # [B, N, M]
+
+    else:
+        # Closer to your original implementation.
+        eigenvalues, eigenvectors = torch.linalg.eig(Rz)  # [B,N], [B,N,N]
+
+        # Sort by abs eigenvalue descending, batched.
+        idx = torch.argsort(torch.abs(eigenvalues), dim=1, descending=True)[:, :M]  # [B,M]
+
+        # Gather eigenvector columns.
+        Us = torch.gather(
+            eigenvectors,
+            dim=2,
+            index=idx[:, None, :].expand(-1, N, -1),
+        )  # [B, N, M]
+
+    # Overlapping subarrays.
+    Us_upper = Us[:, :-1, :]  # [B, N-1, M]
+    Us_lower = Us[:, 1:, :]   # [B, N-1, M]
+
+    # Phi = pinv(Us_upper) @ Us_lower
+    # Batched pinv and matmul.
+    phi = torch.linalg.pinv(Us_upper) @ Us_lower  # [B, M, M]
+
+    # Batched eigenvalues of Phi.
+    phi_eigenvalues, phi_eigenvectors = torch.linalg.eig(phi)  # [B, M], [B, M, M]
+
+    # Original convention:
+    # doa = -arcsin(angle(lambda) / pi)
+    phase = torch.angle(phi_eigenvalues)
+    sin_theta = phase / math.pi
+    sin_theta = torch.clamp(sin_theta, -1.0 + clamp_eps, 1.0 - clamp_eps)
+
+    doa_predictions = -torch.arcsin(sin_theta)  # [B, M], radians
+
+    if sort_doa:
+        doa_predictions, order = torch.sort(doa_predictions, dim=1)
+        phi_eigenvalues = torch.gather(phi_eigenvalues, dim=1, index=order)
+
+    subspace_info = {
+        "eigenvalues": eigenvalues,
+        "eigenvectors": eigenvectors,
+        "signal_subspace": Us,
+        "phi": phi,
+        "phi_eigenvalues": phi_eigenvalues,
+        "phi_eigenvectors": phi_eigenvectors,
+    }
+
+    return doa_predictions, subspace_info
 
 def esprit(Rz: torch.Tensor, M: int, batch_size: int):
     """Implementation of the model-based Esprit algorithm, support Pytorch, intended for

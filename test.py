@@ -59,7 +59,7 @@ def calculate_true_uncertainty(doa_true_rad, samples, plot=False, viz_prefix="")
     sigma_true = torch.zeros(iq_samples.shape[0], iq_samples.shape[1], num_sources, device=device)
 
     for subarray_index in range(iq_samples.shape[1]):
-        sigma_true[:, subarray_index, :] = uncertainty_block.forward(
+        sigma_true[:, subarray_index, :], _ = uncertainty_block.forward(
             torch.rad2deg(doa_true_rad[:, subarray_index, :]),
             Rx=RX_batch[:, subarray_index, :, :]
         )
@@ -294,7 +294,7 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
     }
 
 
-def main(profiler=None):
+def main(profiler=None, argv=None):
     parser = argparse.ArgumentParser("Test Multi-Subarrays Model")
     parser.add_argument("--test_dataset_path", required=True, help="Path to test dataset .pt file")
     parser.add_argument("--config_path", required=True, help="Path to YAML config file")
@@ -328,7 +328,7 @@ def main(profiler=None):
     parser.add_argument("--loss_function", type=str, default="CombinedUncertaintyLoss",
                         help="Loss Function to test with")
     parser.add_argument("--lambda_val", type=float, default=0.5, help="Lambda value for UE Loss")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -361,7 +361,7 @@ def main(profiler=None):
             model = DataDrivenComplexNet(
                 N=num_antennas,
                 T=num_snapshots,
-                tau=8,
+                tau=args.tau,
                 M=num_sources,
             ).to(device)
         elif args.model_type == "transmusic":
@@ -548,6 +548,8 @@ def main(profiler=None):
 
     if args.log_to_wandb and not args.esprit_baseline:
         wandb.finish()
+
+    return test_metrics
 
 
 if __name__ == "__main__":

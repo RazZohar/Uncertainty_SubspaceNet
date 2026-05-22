@@ -1,292 +1,502 @@
-
-# Imports
-import sys
-import torch
-import os
-import matplotlib.pyplot as plt
-import warnings
-
-from mpl_toolkits.axes_grid1.inset_locator import inset_axes
-
-from .system_model import SystemModelParams
-from .signal_creation import *
-from .data_handler import *
-from .criterions import set_criterions
-from .training import *
-from .evaluation import evaluate
-from .plotting import initialize_figures
-from pathlib import Path
-from .models import ModelGenerator
-
-from .methods import MUSIC, RootMUSIC, Esprit, MVDR
-
-#from .create_codebook import create_codebook as codebook_creation
-
-#import .qunatizer as quantizer
-
-import torch.autograd.profiler as profiler
-from torch.profiler import profile, record_function, ProfilerActivity
-
-import numpy as np
+# ---------------- uncertainty_block.py ----------------
+"""
+Batched PyTorch implementation of the theoretical ESPRIT uncertainty block.
 
 
-# Initialization
-warnings.simplefilter("ignore")
-os.system("cls||clear")
-plt.close("all")
 
-# Use this flag to generate graph
-plot_spectrum_flag = True
+Expected interface:
+    sigma_deg = UncertaintyEstimation(signal_shape=T)(doas_deg, Rx)
 
+where:
+    doas_deg : [B, M]        real tensor, degrees, same convention as the network output
+    Rx       : [B, N, N]     complex covariance matrix
+    output   : [B, M]        sigma / standard deviation in degrees
 
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+"""
 
+from __future__ import annotations
+
+import itertools
 import math
-import numpy as np
+from typing import Dict, Optional
+
 import torch
-import scipy
-from typing import Optional
+import torch.nn as nn
 
 
+# -----------------------------------------------------------------------------
+# Utilities
+# -----------------------------------------------------------------------------
 
-# ===================== ESPRIT (overlapped, Δ=λ/2) =====================
+def _as_complex_dtype(dtype: torch.dtype) -> torch.dtype:
+    if dtype in (torch.complex64, torch.complex128):
+        return dtype
+    if dtype == torch.float64:
+        return torch.complex128
+    return torch.complex64
 
-def build_overlapped_selectors(M: int, shift: int = 1):
-    rows = M - shift
-    J1 = np.zeros((rows, M)); J2 = np.zeros((rows, M))
-    for r in range(rows):
-        J1[r, r] = 1.0
-        J2[r, r + shift] = 1.0
+
+def _real_dtype_from_complex(dtype: torch.dtype) -> torch.dtype:
+    if dtype == torch.complex128:
+        return torch.float64
+    return torch.float32
+
+
+def build_overlapped_selectors_torch(
+    n_antennas: int,
+    shift: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Build overlapped ESPRIT selectors J1,J2.
+
+    J1 selects sensors [0, ..., N-shift-1]
+    J2 selects sensors [shift, ..., N-1]
+    """
+    rows = n_antennas - shift
+    if rows <= 0:
+        raise ValueError(f"Invalid shift={shift} for n_antennas={n_antennas}")
+
+    J1 = torch.zeros(rows, n_antennas, device=device, dtype=dtype)
+    J2 = torch.zeros(rows, n_antennas, device=device, dtype=dtype)
+
+    idx = torch.arange(rows, device=device)
+    J1[idx, idx] = 1.0
+    J2[idx, idx + shift] = 1.0
+
     return J1, J2
 
-def esprit_overlapped(Rhat: np.ndarray, d_sources: int, shift: int = 1):
+
+def rcov_conj_gaussian_plugin_torch(Rhat: torch.Tensor, ns: int | float) -> torch.Tensor:
     """
-    Classical ESPRIT with overlapped subarrays:
-      E_x = J1 E_s,  E_y = J2 E_s,  F = pinv(E_x) @ E_y
-    Returns right/left eigenvectors of F and selectors J1,J2.
+    Batched Gaussian plug-in covariance of covariance entries.
+
+    Matches the NumPy code:
+
+        term1 = Rhat[:, None, :, None] * conj(Rhat)[None, :, None, :]
+        term2 = Rhat[:, None, None, :] * conj(Rhat)[None, :, :, None]
+        Rcov_conj = (term1 + term2) / Ns
+
+    Batched shape:
+        Rhat       : [B, N, N]
+        Rcov_conj  : [B, N, N, N, N]
+
+    Axis meaning:
+        Rcov_conj[b, a1, a2, b1, b2]
     """
-    M = Rhat.shape[0]
-    evals, evecs = np.linalg.eigh(Rhat)
-    idx = np.argsort(evals)[-d_sources:].copy()
-    E_s = evecs[:, idx]
-    J1, J2 = build_overlapped_selectors(M, shift=shift)
-    E_x, E_y = J1 @ E_s, J2 @ E_s
-    F = np.linalg.pinv(E_x) @ E_y
-    lam, Q, V = scipy.linalg.eig(F, left=True, right=True)
+    if Rhat.ndim != 3:
+        raise ValueError(f"Rhat must be [B,N,N], got {tuple(Rhat.shape)}")
+
+    term1 = Rhat[:, :, None, :, None] * Rhat.conj()[:, None, :, None, :]
+    term2 = Rhat[:, :, None, None, :] * Rhat.conj()[:, None, :, :, None]
+    return (term1 + term2) / float(ns)
+
+
+# -----------------------------------------------------------------------------
+# Batched ESPRIT
+# -----------------------------------------------------------------------------
+
+def batched_esprit_overlapped_torch(
+    Rhat: torch.Tensor,
+    d_sources: int,
+    shift: int = 1,
+) -> Dict[str, torch.Tensor]:
+    """
+    Batched classical ESPRIT with overlapped subarrays.
+
+    Rhat:
+        [B, N, N] complex Hermitian covariance matrices
+
+    Returns:
+        E_s, E_x, E_y, J1, J2, F, lambda, V, evals, evecs, sig_idx
+    """
+    if Rhat.ndim != 3:
+        raise ValueError(f"Rhat must be [B,N,N], got {tuple(Rhat.shape)}")
+
+    B, N, N2 = Rhat.shape
+    if N != N2:
+        raise ValueError(f"Rhat must be square, got {tuple(Rhat.shape)}")
+    if d_sources <= 0 or d_sources >= N:
+        raise ValueError(f"d_sources must satisfy 0 < d_sources < N, got d_sources={d_sources}, N={N}")
+
+    device = Rhat.device
+    dtype = Rhat.dtype
+
+    # torch.linalg.eigh returns ascending eigenvalues and matching eigenvectors.
+    evals, evecs = torch.linalg.eigh(Rhat)  # evals: [B,N], evecs: [B,N,N]
+
+    # Signal subspace: eigenvectors of largest d eigenvalues.
+    sig_idx = torch.arange(N - d_sources, N, device=device)
+    E_s = evecs[:, :, -d_sources:]  # [B,N,d]
+
+    J1, J2 = build_overlapped_selectors_torch(
+        n_antennas=N,
+        shift=shift,
+        device=device,
+        dtype=dtype,
+    )
+
+    E_x = torch.einsum("rn,bnd->brd", J1, E_s)  # [B,rows,d]
+    E_y = torch.einsum("rn,bnd->brd", J2, E_s)  # [B,rows,d]
+
+    F = torch.linalg.pinv(E_x) @ E_y             # [B,d,d]
+    lam, V = torch.linalg.eig(F)                 # lam: [B,d], V: [B,d,d]
+
     return {
-        "E_s": E_s, "E_x": E_x, "E_y": E_y, "J1": J1, "J2": J2, "F": F,
-        "lambda": lam, "V": V, "Q": Q,
-        "evals": evals, "evecs": evecs, "sig_idx": idx
+        "E_s": E_s,
+        "E_x": E_x,
+        "E_y": E_y,
+        "J1": J1,
+        "J2": J2,
+        "F": F,
+        "lambda": lam,
+        "V": V,
+        "evals": evals,
+        "evecs": evecs,
+        "sig_idx": sig_idx,
     }
 
-# ================== 4th‑order moment (Eq. 63, Gaussian) ==================
 
-def rcov_conj_gaussian_plugin(Rhat: np.ndarray, Ns: int) -> np.ndarray:
-    #return (Rhat[:, None, :, None] * Rhat[None, :, None, :]) / Ns
+# -----------------------------------------------------------------------------
+# Batched permutation matching
+# -----------------------------------------------------------------------------
 
-    term1 = Rhat[:, None, :, None] * np.conj(Rhat)[None, :, None, :]
-    term2 = Rhat[:, None, None, :] * np.conj(Rhat)[None, :, :, None]
-    return (term1 + term2) / Ns
-
-# =============== Eq. 66: eigenvector perturbation blocks ===============
-
-def compute_delta_s_covariance_blocks_eq66(
-    S_full: np.ndarray,
-    alpha: np.ndarray,
-    Rcov_conj: np.ndarray,
-    signal_indices,
-    denom_eps: float = 1e-12,
-    use_full_sums: bool = True,   # True = literal Eq. (62)/(66)
-):
+def _permutation_tensor(d: int, device: torch.device) -> torch.Tensor:
     """
-    Returns covHs_gh, covTs_gh of shape (d, d, M, M).
-
-    If use_full_sums=False:
-        sums only over noise eigenvectors (common reduced form in subspace perturbation use).
-    If use_full_sums=True:
-        uses the literal paper sums l != g and n != h.
+    All permutations of range(d). Fine for small number of sources M=1..4.
     """
-    S_full = np.asarray(S_full)
-    alpha = np.asarray(alpha)
-    Rcov_conj = np.asarray(Rcov_conj)
+    return torch.tensor(
+        list(itertools.permutations(range(d))),
+        device=device,
+        dtype=torch.long,
+    )
 
-    M = S_full.shape[0]
-    sig_idx = np.asarray(signal_indices)
-    d = sig_idx.size
 
-    # Eq. (66) note: E{ΔR[a1,a2] ΔR[b1,b2]} = E{ΔR[a1,a2] ΔR*[b2,b1]}
-    Rcov_unconj = np.swapaxes(Rcov_conj, 2, 3)
+def batched_match_perm_to_external_torch(
+    doas_deg: torch.Tensor,
+    lam: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Torch replacement for scipy.optimize.linear_sum_assignment.
 
-    covHs_gh = np.zeros((d, d, M, M), dtype=complex)
-    covTs_gh = np.zeros((d, d, M, M), dtype=complex)
+    doas_deg:
+        [B,d] network/external DOAs in degrees
 
-    noise_idx = np.setdiff1d(np.arange(M), sig_idx)
+    lam:
+        [B,d] ESPRIT roots/eigenvalues
+
+    Returns:
+        perm: [B,d]
+        perm[b,i] is the ESPRIT/internal eigenvalue index matched to external DOA i.
+
+    This brute-force matcher is very fast for d=1,2,3,4 and avoids CPU/SciPy.
+    """
+    if doas_deg.ndim != 2:
+        raise ValueError(f"doas_deg must be [B,d], got {tuple(doas_deg.shape)}")
+    if lam.ndim != 2:
+        raise ValueError(f"lam must be [B,d], got {tuple(lam.shape)}")
+
+    B, d = doas_deg.shape
+    if lam.shape != (B, d):
+        raise ValueError(f"Shape mismatch doas_deg={tuple(doas_deg.shape)}, lam={tuple(lam.shape)}")
+
+    device = doas_deg.device
+    real_dtype = doas_deg.dtype
+
+    # Same convention as your old NumPy code:
+    # expected_lam = exp(-j*pi*sin(theta_deg))
+    expected_lam = torch.exp(
+        -1j * torch.tensor(math.pi, device=device, dtype=real_dtype) * torch.sin(torch.deg2rad(doas_deg))
+    )  # [B,d]
+
+    actual_lam = lam / lam.abs().clamp_min(1e-12)
+
+    # cost[b, external_i, internal_j]
+    cost = (expected_lam[:, :, None] - actual_lam[:, None, :]).abs()
+
+    if d == 1:
+        return torch.zeros(B, 1, device=device, dtype=torch.long)
+
+    perms = _permutation_tensor(d, device=device)  # [P,d]
+    P = perms.shape[0]
+
+    # selected_cost[b,p,i] = cost[b,i,perms[p,i]]
+    cost_expanded = cost[:, None, :, :].expand(B, P, d, d)  # [B,P,d,d]
+    gather_index = perms[None, :, :, None].expand(B, P, d, 1)  # [B,P,d,1]
+
+    selected_cost = torch.gather(
+        cost_expanded,
+        dim=3,
+        index=gather_index,
+    ).squeeze(-1)  # [B,P,d]
+
+    scores = selected_cost.sum(dim=-1)  # [B,P]
+    best = torch.argmin(scores, dim=1)  # [B]
+
+    return perms[best]  # [B,d]
+
+
+def batched_doa_from_lam_deg_torch(lam: torch.Tensor) -> torch.Tensor:
+    """
+    DOA from ESPRIT root using the same sign convention as your old helper:
+
+        s = angle(lam) / pi
+        doa = -arcsin(s)
+
+    Returns degrees.
+    """
+    s = torch.clamp(torch.angle(lam) / math.pi, -1.0, 1.0)
+    return torch.rad2deg(-torch.arcsin(s))
+
+
+# -----------------------------------------------------------------------------
+# Eq. 66 blocks
+# -----------------------------------------------------------------------------
+
+def compute_delta_s_covariance_blocks_eq66_torch(
+    S_full: torch.Tensor,
+    alpha: torch.Tensor,
+    Rcov_conj: torch.Tensor,
+    d_sources: int,
+    denom_eps: float = 1e-6,
+    use_full_sums: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched torch version of compute_delta_s_covariance_blocks_eq66.
+
+    Inputs:
+        S_full:
+            [B,N,N] full eigenvector matrix from torch.linalg.eigh
+
+        alpha:
+            [B,N] eigenvalues from torch.linalg.eigh
+
+        Rcov_conj:
+            [B,N,N,N,N]
+
+        d_sources:
+            number of sources
+
+    Returns:
+        covHs_gh:
+            [B,d,d,N,N]
+
+        covTs_gh:
+            [B,d,d,N,N]
+    """
+    if S_full.ndim != 3:
+        raise ValueError(f"S_full must be [B,N,N], got {tuple(S_full.shape)}")
+    if alpha.ndim != 2:
+        raise ValueError(f"alpha must be [B,N], got {tuple(alpha.shape)}")
+    if Rcov_conj.ndim != 5:
+        raise ValueError(f"Rcov_conj must be [B,N,N,N,N], got {tuple(Rcov_conj.shape)}")
+
+    B, N, N2 = S_full.shape
+    if N != N2:
+        raise ValueError(f"S_full must be square, got {tuple(S_full.shape)}")
+    if alpha.shape != (B, N):
+        raise ValueError(f"alpha shape mismatch: alpha={tuple(alpha.shape)}, expected {(B, N)}")
+    if Rcov_conj.shape != (B, N, N, N, N):
+        raise ValueError(f"Rcov_conj shape mismatch: {tuple(Rcov_conj.shape)}")
+
+    device = S_full.device
+    dtype = S_full.dtype
+
+    sig_idx = list(range(N - d_sources, N))
+    noise_idx = list(range(0, N - d_sources))
+
+    # Same as np.swapaxes(Rcov_conj, 2, 3) on the non-batched tensor.
+    # Batched tensor axes are [B,a1,a2,b1,b2], so swap b1/b2 -> dims 3 and 4.
+    Rcov_unconj = Rcov_conj.transpose(3, 4)
+
+    covHs = torch.zeros(B, d_sources, d_sources, N, N, device=device, dtype=dtype)
+    covTs = torch.zeros_like(covHs)
 
     for gi, g in enumerate(sig_idx):
-        s_g = S_full[:, g]
+        s_g = S_full[:, :, g]  # [B,N]
 
-        l_indices = np.setdiff1d(np.arange(M), [g]) if use_full_sums else noise_idx
+        l_indices = [idx for idx in range(N) if idx != g] if use_full_sums else noise_idx
 
         for hi, h in enumerate(sig_idx):
-            s_h = S_full[:, h]
+            s_h = S_full[:, :, h]  # [B,N]
 
-            n_indices = np.setdiff1d(np.arange(M), [h]) if use_full_sums else noise_idx
+            n_indices = [idx for idx in range(N) if idx != h] if use_full_sums else noise_idx
 
-            accum_H = np.zeros((M, M), dtype=complex)
-            accum_T = np.zeros((M, M), dtype=complex)
+            accum_H = torch.zeros(B, N, N, device=device, dtype=dtype)
+            accum_T = torch.zeros(B, N, N, device=device, dtype=dtype)
 
             for l in l_indices:
-                s_l = S_full[:, l]
-
-                # common first two contractions: s_l^* , s_g
-                T1_H = np.tensordot(s_l.conj(), Rcov_conj, axes=(0, 0))   # [a2,b1,b2]
-                T1_T = np.tensordot(s_l.conj(), Rcov_unconj, axes=(0, 0)) # [a2,b1,b2]
-
-                T2_H = np.tensordot(s_g, T1_H, axes=(0, 0))               # [b1,b2]
-                T2_T = np.tensordot(s_g, T1_T, axes=(0, 0))               # [b1,b2]
+                s_l = S_full[:, :, l]  # [B,N]
 
                 for n in n_indices:
-                    s_n = S_full[:, n]
+                    s_n = S_full[:, :, n]  # [B,N]
 
-                    # Eq. (62): ... s_{n,b1} s^*_{h,b2}
-                    T3_H = np.tensordot(s_n, T2_H, axes=(0, 0))           # [b2]
-                    coeff_H = np.vdot(s_h, T3_H)                          # sum_b2 s_h^*[b2] * T3_H[b2]
+                    # Equivalent to:
+                    # sum_{a1,a2,b1,b2} conj(s_l[a1]) * s_g[a2] *
+                    #                      s_n[b1] * conj(s_h[b2]) *
+                    #                      Rcov_conj[a1,a2,b1,b2]
+                    coeff_H = torch.einsum(
+                        "bp,bq,br,bs,bpqrs->b",
+                        s_l.conj(),
+                        s_g,
+                        s_n,
+                        s_h.conj(),
+                        Rcov_conj,
+                    )
 
-                    # Eq. (66): ... s^*_{n,b1} s_{h,b2}
-                    T3_T = np.tensordot(s_n.conj(), T2_T, axes=(0, 0))    # [b2]
-                    coeff_T = np.dot(T3_T, s_h)                           # no conjugation on s_h
+                    # Equivalent to the old covTs branch with Rcov_unconj.
+                    coeff_T = torch.einsum(
+                        "bp,bq,br,bs,bpqrs->b",
+                        s_l.conj(),
+                        s_g,
+                        s_n.conj(),
+                        s_h,
+                        Rcov_unconj,
+                    )
 
-                    denom = (alpha[g] - alpha[l]) * (alpha[h] - alpha[n])
+                    denom = (alpha[:, g] - alpha[:, l]) * (alpha[:, h] - alpha[:, n])
+                    safe = denom.abs() > denom_eps
+                    safe_denom = torch.where(safe, denom, torch.ones_like(denom))
 
-                    if abs(denom) < denom_eps:
-                        continue
+                    coeff_H = torch.where(safe, coeff_H / safe_denom, torch.zeros_like(coeff_H))
+                    coeff_T = torch.where(safe, coeff_T / safe_denom, torch.zeros_like(coeff_T))
 
-                    accum_H += (coeff_H / denom) * np.outer(s_l, s_n.conj())  # s_l s_n^H
-                    accum_T += (coeff_T / denom) * np.outer(s_l, s_n)         # s_l s_n^T
+                    outer_H = s_l[:, :, None] * s_n.conj()[:, None, :]  # [B,N,N]
+                    outer_T = s_l[:, :, None] * s_n[:, None, :]         # [B,N,N]
 
-            covHs_gh[gi, hi] = accum_H
-            covTs_gh[gi, hi] = accum_T
+                    accum_H = accum_H + coeff_H[:, None, None] * outer_H
+                    accum_T = accum_T + coeff_T[:, None, None] * outer_T
 
-    return covHs_gh, covTs_gh
+            covHs[:, gi, hi] = accum_H
+            covTs[:, gi, hi] = accum_T
 
-# ================= Eq. 52 / Eq. 53 with v‑weighting =================
+    return covHs, covTs
 
-def _assemble_middle_from_v(v_i: np.ndarray, cov_gh: np.ndarray, conjugate_h: bool = True) -> np.ndarray:
+
+# -----------------------------------------------------------------------------
+# Eq. 52 / Eq. 53 / Eq. 58
+# -----------------------------------------------------------------------------
+
+def compute_eq52_eq53_all_modes_torch(
+    lam_ext: torch.Tensor,
+    V_ext: torch.Tensor,
+    E_x: torch.Tensor,
+    J1: torch.Tensor,
+    J2: torch.Tensor,
+    covHs: torch.Tensor,
+    covTs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
     """
-    Build Σ_{g,h} v_{ig} (v_{ih}^* or v_{ih}) * Cov[g,h], Cov[g,h] is (M x M).
-    Accepts cov_gh shaped (d,d,M,M) or (M,M,d,d).
+    Batched Eq.52/Eq.53 for all modes.
+
+    Inputs:
+        lam_ext:
+            [B,d] matched ESPRIT eigenvalues
+
+        V_ext:
+            [B,d,d], columns are right eigenvectors matched to external DOA order
+
+        E_x:
+            [B,rows,d]
+
+        J1,J2:
+            [rows,N]
+
+        covHs,covTs:
+            [B,d,d,N,N]
+
+    Returns:
+        eq52:
+            [B,d] complex
+
+        eq53:
+            [B,d] complex
     """
-    v = np.asarray(v_i).reshape(-1)
-    cov = np.asarray(cov_gh)
-    if cov.ndim != 4:
-        raise ValueError("cov_gh must be 4D.")
-    if cov.shape[:2] != (v.size, v.size) and cov.shape[-2:] != (v.size, v.size):
-        raise ValueError("cov_gh dims must match len(v_i).")
-    if cov.shape[-2:] == (v.size, v.size):  # (M,M,d,d) -> (d,d,M,M)
-        cov = np.moveaxis(cov, (-2, -1), (0, 1))
-    W = np.outer(v, np.conj(v)) if conjugate_h else np.outer(v, v)
-    return np.tensordot(W, cov, axes=([0, 1], [0, 1]))  # (M x M)
+    if lam_ext.ndim != 2:
+        raise ValueError(f"lam_ext must be [B,d], got {tuple(lam_ext.shape)}")
+    if V_ext.ndim != 3:
+        raise ValueError(f"V_ext must be [B,d,d], got {tuple(V_ext.shape)}")
 
-def enforce_psd_onto_matrix(matrix):
+    B, d = lam_ext.shape
+
+    # E_x_pinv: [B,d,rows]
+    E_x_pinv = torch.linalg.pinv(E_x)
+
+    # Rows of inv(V) are left eigenvector rows satisfying q_i @ V[:,j] = delta_ij.
+    # This matches the old use of q_i normalized so q_i @ v_i = 1.
+    Q_rows = torch.linalg.inv(V_ext)  # [B,d,d]
+
+    # middle52_i = sum_{g,h} v_i[g] conj(v_i[h]) covHs[g,h]
+    # middle53_i = sum_{g,h} v_i[g]      v_i[h]  covTs[g,h]
+    W52 = torch.einsum("bgi,bhi->bigh", V_ext, V_ext.conj())  # [B,i,g,h]
+    W53 = torch.einsum("bgi,bhi->bigh", V_ext, V_ext)         # [B,i,g,h]
+
+    middle52 = torch.einsum("bigh,bghmn->bimn", W52, covHs)   # [B,d,N,N]
+    middle53 = torch.einsum("bigh,bghmn->bimn", W53, covTs)   # [B,d,N,N]
+
+    # Eq.52:
+    # q_i @ pinv(E_x) @ (J1 - conj(lambda_i) J2)
+    A52 = J1[None, None, :, :] - lam_ext.conj()[:, :, None, None] * J2[None, None, :, :]
+
+    # Eq.53:
+    # q_i @ pinv(E_x) @ (J2 - lambda_i J1)
+    A53 = J2[None, None, :, :] - lam_ext[:, :, None, None] * J1[None, None, :, :]
+
+    left52 = torch.einsum("bid,bdr,birn->bin", Q_rows, E_x_pinv, A52)  # [B,d,N]
+    left53 = torch.einsum("bid,bdr,birn->bin", Q_rows, E_x_pinv, A53)  # [B,d,N]
+
+    eq52 = torch.einsum("bin,binm,bim->bi", left52, middle52, left52.conj())
+    eq53 = torch.einsum("bin,binm,bim->bi", left53, middle53, left53)
+
+    return eq52, eq53
+
+
+def compute_eq58_half_lambda_torch(
+    lam_ext: torch.Tensor,
+    eq52: torch.Tensor,
+    eq53: torch.Tensor,
+    theta_deg: torch.Tensor,
+    eps: float = 1e-8,
+    max_var_deg2: float = 8100.0,
+) -> torch.Tensor:
     """
-    I use Hermittian and then Diagonal Loading
-    :param matrix:
-    :return: PSD matrix from the given input matrix
+    Torch version matching the active NumPy Eq.58 branch.
+
+    Old code did:
+        var_hat = compute_eq58_half_lambda_from_eq52_eq53(
+            lam_i, eq52_i, eq53_i, deg2rad(theta_hat_deg[i] + 90)
+        )
+
+    and inside:
+        eq58_scale_half_lambda(theta_i) uses cos(theta_i + pi/2)^2
+
+    Therefore:
+        cos((theta_deg + 90deg) + 90deg)^2
+        = cos(theta_deg + 180deg)^2
+        = cos(theta_deg)^2
+
+    So this implementation directly uses cos(theta_deg)^2.
+
+    Also matches the active branch:
+        term1 = real(eq52)
+        term2 = real(eq53 * conj(lam)^2)
+        var_lambda = term1 - term2
     """
-    #M = (matrix + matrix.conj().T) / 2
-    M = matrix
-    eigenvalues = np.linalg.eigvals(M)
-    min_eig = np.min(eigenvalues)
+    real_dtype = theta_deg.dtype
+    theta = torch.deg2rad(theta_deg)
 
-    # 3. Calculate the required shift
-    epsilon = 1e-6
-    shift = max(0, -min_eig) + epsilon
+    c2 = torch.cos(theta).pow(2).clamp_min(eps)
+    scale = 1.0 / (2.0 * math.pi**2 * c2)
 
-    # 4. Apply diagonal loading
-    M_psd = M + shift * np.eye(M.shape[0])
+    var_lambda = eq52.real - (eq53 * (lam_ext.conj() ** 2)).real
+    var_rad2 = torch.clamp(scale * var_lambda, min=0.0)
 
-    return M_psd
+    deg_per_rad = torch.tensor(180.0 / math.pi, device=theta_deg.device, dtype=real_dtype)
+    var_deg2 = var_rad2 * deg_per_rad.pow(2)
 
-def compute_eq52_weighted(lam_i, q_i, E_x, W1, W2, covHs_gh, v_i):
-    E_x_pinv = np.linalg.pinv(E_x)
-    middle = _assemble_middle_from_v(v_i, covHs_gh, conjugate_h=True)
+    return torch.clamp(var_deg2, min=0.0, max=max_var_deg2)
 
-    if np.min(np.linalg.eigvals(middle)) < 0:
-        print(f'52 middle {np.linalg.eigvals(middle)=} result non PSD matrix')
-    left   = q_i @ E_x_pinv @ (W1 - np.conj(lam_i) * W2)                 # (1 x M)
-    right  = (W1 - np.conj(lam_i) * W2).conj().T @ E_x_pinv.conj().T @ q_i.conj().T  # (M x 1)
-    return (left @ middle @ right).item()
-
-def compute_eq53_weighted(lam_i, q_i, E_x, W1, W2, covTs_gh, v_i):
-    E_x_pinv = np.linalg.pinv(E_x)
-    middle = _assemble_middle_from_v(v_i, covTs_gh, conjugate_h=False)
-    """if np.min(np.linalg.eigvals(middle)) < 0:
-        print(f'53 middle {np.linalg.eigvals(middle)=} result non PSD matrix')
-        middle = enforce_psd_onto_matrix(middle)
-        print(f'{np.linalg.eigvals(middle)=} , {np.min(np.linalg.eigvals(middle))=}')
-    """
-    left   = q_i @ E_x_pinv @ (W2 - lam_i * W1)
-    right  = (W2 - lam_i * W1).T @ E_x_pinv.T @ q_i.T
-    return (left @ middle @ right).item()
-# ================= Eq. 58 with Δ = λ/2 simplified =================
-
-def eq58_scale_half_lambda(theta_i: float, eps: float = 1e-8) -> float:
-    c2 = max(np.cos(theta_i + np.pi/2)**2, eps)  # guard endfire
-    return 1.0 / (2 * np.pi**2 * c2)
-
-def compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_val, eq53_val, theta_i,
-                                            clip_nonneg: bool = True, eps: float = 1e-8) -> float:
-    """
-    scale = eq58_scale_half_lambda(theta_i, eps)
-
-    #mag = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i)**2))
-    mag = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
-
-    #print(f'{scale=}, {mag=}, {eq52_val=}, {eq53_val=},  ')
-    val = scale * mag
-    return float(max(val, 0.0)) if clip_nonneg else float(val)
-
-    #var_lambda = np.real(eq52_val) - np.real(eq53_val * (lam_i ** 2))
-    var_lambda = np.real(eq52_val) - np.real(eq53_val * (np.conj(lam_i) ** 2))
-
-    # Yuen 96 Equation 58 scales the lambda variance by 1/2
-    var_lambda = 0.5 * var_lambda
-
-    # Safe clipping
-    if clip_nonneg and var_lambda < 0:
-        var_lambda = 1e-12
-
-    # Derivative mapped to Yuen's domain (theta_rad now represents [0, pi])
-    derivative_sq = (np.pi * np.sin(theta_i)) ** 2
-    if derivative_sq < 1e-12:
-        derivative_sq = 1e-12
-
-    return var_lambda / derivative_sq
-    """
-
-    scale = eq58_scale_half_lambda(theta_i, eps)
-
-    # Calculate the true magnitude squared of the empirical eigenvalue
-    mag_sq = np.abs(lam_i) ** 2
-
-    # Correct normalizations derived from Var(Im(d_lambda / lambda))
-    term1 = np.real(eq52_val)# / mag_sq
-
-    # eq53_val / lam_i^2 is mathematically equivalent to (eq53_val * (lam_i^*)^2) / |lam_i|^4
-    term2 = np.real(eq53_val * (np.conj(lam_i) ** 2))# / (mag_sq ** 2)
-
-    var_lambda = term1 - term2
-
-    val = scale * var_lambda
-    return float(max(val, 0.0)) if clip_nonneg else float(val)
-
-# ===================== Data generation (multi‑source) =====================
-
-
-import numpy as np
-import matplotlib.pyplot as plt
-import itertools
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -300,6 +510,9 @@ def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
         doa_pred   : [Batch, num_targets]
         sigma_pred : [Batch, num_targets]
     """
+    doa_pred = doa_pred.detach().numpy()
+    sigma_pred = sigma_pred.detach().numpy()
+
     doa = np.asarray(doa_pred, dtype=float)
     sig = np.asarray(sigma_pred, dtype=float)
 
@@ -346,180 +559,198 @@ def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
     fig.suptitle(title)
     plt.show()
 
-from scipy.optimize import linear_sum_assignment
+# -----------------------------------------------------------------------------
+# Main module
+# -----------------------------------------------------------------------------
 
 class UncertaintyEstimation(nn.Module):
-    def __init__(self, signal_shape):
+    """
+    Batched GPU/torch UncertaintyEstimation.
+
+    Args:
+        signal_shape:
+            Number of snapshots Ns/T used in the Gaussian plug-in covariance.
+
+        subarray_shift:
+            ESPRIT shift. Your current old block defaults to 1.
+
+        complex_dtype:
+            Optional forced complex dtype. Use torch.complex64 for speed,
+            torch.complex128 for debugging/numerical comparison.
+
+        chunk_size:
+            Optional chunk size over the batch dimension to reduce memory.
+            Example: chunk_size=128. This still avoids per-sample CPU/SciPy loops.
+
+        use_full_sums:
+            Matches the old Eq.66 implementation when True.
+    """
+
+    def __init__(
+        self,
+        signal_shape: int | float,
+        subarray_shift: int = 1,
+        complex_dtype: Optional[torch.dtype] = None,
+        chunk_size: Optional[int] = None,
+        denom_eps: float = 1e-6,
+        use_full_sums: bool = True,
+        max_var_deg2: float = 8100.0,
+    ):
         super().__init__()
-        self.__signal_shape = signal_shape
-        self.__subarray_shift = 1
+        self.signal_shape = signal_shape
+        self.subarray_shift = int(subarray_shift)
+        self.complex_dtype = complex_dtype
+        self.chunk_size = chunk_size
+        self.denom_eps = float(denom_eps)
+        self.use_full_sums = bool(use_full_sums)
+        self.max_var_deg2 = float(max_var_deg2)
 
     def set_subarray_shift(self, subarray_shift: int):
-        self.__subarray_shift = subarray_shift
+        self.subarray_shift = int(subarray_shift)
 
-    def doa_from_lam_deg(self, lam):
-        # matches your esprit() sign convention
-        s = np.clip(np.angle(lam) / np.pi, -1.0, 1.0)
-        return np.rad2deg(-np.arcsin(s))
-
-    def match_perm_to_external(self, doas_deg, lam):
+    def forward(self, doas_deg: torch.Tensor, Rx: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
         """
-        Matches unordered ESPRIT roots (lam) to the Neural Network's ordered angles (doas_deg)
-        by measuring distance directly on the Complex Unit Circle.
+        Return sigma/std in degrees.
+
+        doas_deg:
+            [B,M] in degrees
+
+        Rx:
+            [B,N,N] complex covariance matrix
+
+        Returns:
+            If return_cov_diag is False:
+                sigma_deg:
+                    [B,M], standard deviation in degrees
+
+            If return_cov_diag is True:
+                sigma_deg, cov_diag_deg2:
+                    both [B,M], where cov_diag_deg2 is the matched covariance
+                    diagonal / variance in deg^2
         """
-        doas_deg = np.asarray(doas_deg)
+        if doas_deg.ndim != 2:
+            raise ValueError(f"doas_deg must be [B,M], got {tuple(doas_deg.shape)}")
+        if Rx.ndim != 3:
+            raise ValueError(f"Rx must be [B,N,N], got {tuple(Rx.shape)}")
+        if Rx.shape[0] != doas_deg.shape[0]:
+            raise ValueError(f"Batch mismatch doas_deg={tuple(doas_deg.shape)}, Rx={tuple(Rx.shape)}")
 
-        # 1. Convert the Network's physical angles into theoretical ESPRIT roots.
-        # We use your system model's exact phase mapping: e^{-j * pi * sin(theta)}
-        expected_lam = np.exp(-1j * np.pi * np.sin(np.deg2rad(doas_deg)))
+        B = doas_deg.shape[0]
+        if self.chunk_size is not None and B > self.chunk_size:
+            sigma_chunks = []
+            cov_chunks = []
 
-        # 2. Normalize the actual ESPRIT roots to ensure they sit perfectly on the unit circle
-        actual_lam = lam / np.abs(lam)
+            for start in range(0, B, self.chunk_size):
+                end = min(start + self.chunk_size, B)
+                out = self._forward_impl(doas_deg[start:end], Rx[start:end])
 
-        # 3. Create a cost matrix based on Complex Euclidean Distance
-        # This bypasses all arcsin coordinate ambiguities!
-        cost_matrix = np.abs(expected_lam[:, None] - actual_lam[None, :])
+                if self.return_cov_diag:
+                    sigma_chunk, cov_chunk = out
+                    sigma_chunks.append(sigma_chunk)
+                    cov_chunks.append(cov_chunk)
+                else:
+                    sigma_chunks.append(out)
 
-        # 4. Hungarian algorithm to find the optimal 1-to-1 match
-        row_ind, col_ind = linear_sum_assignment(cost_matrix)
+            if self.return_cov_diag:
+                return torch.cat(sigma_chunks, dim=0), torch.cat(cov_chunks, dim=0)
 
-        return col_ind, cost_matrix[row_ind, col_ind]
+            return torch.cat(sigma_chunks, dim=0)
 
-    def compute_predicated_uncertainty(self, doas_deg, Rx):
-        """
-        Given the math formulation calculate the uncertainty
+        return self._forward_impl(doas_deg, Rx)
 
-        Pipeline:
-          • simulate Z
-          • Rhat (no FB), optional small shrinkage
-          • ESPRIT overlapped (Δ=λ/2), use λ "as is" (no |λ| projection)
-          • θ̂ from principal phase, per mode (no unwrapping)
-          • Eq.63 (Gaussian plug‑in) → Eq.66 → Eq.52/53 → Eq.58
-          • empirical errors are 180°‑wrapped, compared by index (i→i)
-          • empirical covariance via PyTorch (wrapped)
+    def _forward_impl(self, doas_deg: torch.Tensor, Rx: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
+        B, d_sources = doas_deg.shape
 
-        Returns dict with empirical bias/variance/MSE (deg, deg²), the full (K×K) empirical
-        covariance (deg²), predicted variances (deg²), and ratios (empirical variance / predicted).
-        """
+        complex_dtype = self.complex_dtype or _as_complex_dtype(Rx.dtype)
+        real_dtype = _real_dtype_from_complex(complex_dtype)
 
-        # 2) covariance (NO FB), optional shrinkage
-        Rhat = Rx.detach().cpu().numpy()
-        doas_deg = doas_deg.detach().cpu().numpy()
+        Rx = Rx.to(dtype=complex_dtype)
+        doas_deg = doas_deg.to(device=Rx.device, dtype=real_dtype)
 
-        Rhat = 0.5 * (Rhat + np.conj(Rhat).T)
+        # Hermitian symmetrization, same as old NumPy code.
+        Rhat = 0.5 * (Rx + Rx.conj().transpose(-1, -2))
 
-        dsrc = len(doas_deg)
-
-        # Collect across trials
-        theta_hat_all = []  # list of (K,) in deg
-        pred_hat_deg2_all = []  # list of (K,) predicted var using θ̂ in scale
-
-        #self.__subarray_shift = 4
-        # 3) ESPRIT (overlapped, shift=1), use λ "as is"
-        esp = esprit_overlapped(Rhat, d_sources=dsrc, shift=self.__subarray_shift)
-        J1, J2, E_x = esp["J1"], esp["J2"], esp["E_x"]
-        lam, V, Q = esp["lambda"], esp["V"], esp["Q"]
-
-        # DOA from principal phase only (no |λ| projection, no phase unwrapping)
-        #theta_es_deg = np.rad2deg(np.arcsin(np.clip(-np.angle(lam_u) / np.pi, -1, 1)))
-
-        theta_hat_deg = doas_deg
-
-        # 4) 4th‑order tensor (Gaussian plug‑in) and Eq.66 blocks
-        Rcov_conj = rcov_conj_gaussian_plugin(Rhat, Ns=self.__signal_shape)
-        alpha_hat = esp["evals"]
-        S_hat = esp["evecs"]
-        sig_idx = esp["sig_idx"]
-
-        covHs_gh, covTs_gh = compute_delta_s_covariance_blocks_eq66(
-            S_hat, alpha_hat, Rcov_conj, sig_idx, denom_eps=1e-6
+        esp = batched_esprit_overlapped_torch(
+            Rhat,
+            d_sources=d_sources,
+            shift=self.subarray_shift,
         )
 
-        """for g in range(dsrc):
-            covHs_gh[g, g] = 0.5 * (covHs_gh[g, g] + covHs_gh[g, g].conj().T)
+        lam = esp["lambda"]                          # [B,d]
+        V = esp["V"]                                  # [B,d,d]
+        E_x = esp["E_x"]                              # [B,rows,d]
+        J1 = esp["J1"]                                # [rows,N]
+        J2 = esp["J2"]                                # [rows,N]
+        alpha_hat = esp["evals"]                      # [B,N]
+        S_hat = esp["evecs"]                          # [B,N,N]
 
-        for g in range(dsrc):
-            for h in range(g + 1, dsrc):
-                A = 0.5 * (covHs_gh[g, h] + covHs_gh[h, g].conj().T)
-                covHs_gh[g, h] = A
-                covHs_gh[h, g] = A.conj().T
-        """
-        #lam_u = lam / np.maximum(np.abs(lam), 1e-12)
-        lam = lam / np.abs(lam)
-        perm_ext_to_int, doa_int = self.match_perm_to_external(theta_hat_deg, lam)
-        lam_ext = lam[perm_ext_to_int]
-        V_ext = V[:, perm_ext_to_int]
-        Q_ext = Q[:, perm_ext_to_int]
+        # Old code normalized roots to unit circle before matching.
+        lam = lam / lam.abs().clamp_min(1e-12)
 
-        #print("external doa:", theta_hat_deg)
-        #print("internal doa :", doa_int)
-        #print("matched doa  :", self.doa_from_lam_deg(lam_ext))
+        # Match ESPRIT modes to the network/external DOA order.
+        #
+        # perm_ext_to_int[b, i] is the internal ESPRIT mode corresponding to
+        # external/network DOA doas_deg[b, i].
+        #
+        # After gathering, lam_ext[:, i] and V_ext[:, :, i] are aligned with
+        # doas_deg[:, i]. Therefore var_deg2 / cov_diag_deg2 is also returned
+        # in the external DOA order, not the arbitrary ESPRIT eigenvalue order.
+        perm_ext_to_int = batched_match_perm_to_external_torch(doas_deg, lam)
 
-        matced_doas =  self.doa_from_lam_deg(lam_ext)
+        lam_ext = torch.gather(lam, dim=1, index=perm_ext_to_int)  # [B,d]
 
-        # 5) per‑mode Eq.52/53/58 (index‑aligned: i->i)
-        pred_hat_deg2 = np.zeros(dsrc)
-        for i in range(dsrc):
-            """
-            v_i = V[:, i][:, None]
-            q_i = Q[:, i].conj()[None, :]
-            q_i = q_i / (q_i @ v_i)
-            lam_i = lam[i]
-            """
-            v_i = V_ext[:, i][:, None]
-            q_i = Q_ext[:, i].conj()[None, :]
-            q_i = q_i / (q_i @ v_i)
-            lam_i = lam_ext[i]
+        # Gather columns of V by matched permutation.
+        V_ext = torch.gather(
+            V,
+            dim=2,
+            index=perm_ext_to_int[:, None, :].expand(-1, d_sources, -1),
+        )  # [B,d,d]
 
-            #v_e = V_ext[:, i][:, None]
-            #q_e = Q_ext[:, i].conj()[None, :]
-            #q_e = q_e / (q_e @ v_e)
-            #lam_e = lam_ext[i]
+        Rcov_conj = rcov_conj_gaussian_plugin_torch(
+            Rhat,
+            ns=self.signal_shape,
+        )  # [B,N,N,N,N]
 
-            eq52_i = compute_eq52_weighted(lam_i, q_i, E_x, J1, J2, covHs_gh, v_i)
-            eq53_i = compute_eq53_weighted(lam_i, q_i, E_x, J1, J2, covTs_gh, v_i)
+        covHs, covTs = compute_delta_s_covariance_blocks_eq66_torch(
+            S_full=S_hat,
+            alpha=alpha_hat,
+            Rcov_conj=Rcov_conj,
+            d_sources=d_sources,
+            denom_eps=self.denom_eps,
+            use_full_sums=self.use_full_sums,
+        )
+
+        eq52, eq53 = compute_eq52_eq53_all_modes_torch(
+            lam_ext=lam_ext,
+            V_ext=V_ext,
+            E_x=E_x,
+            J1=J1,
+            J2=J2,
+            covHs=covHs,
+            covTs=covTs,
+        )
+
+        var_deg2 = compute_eq58_half_lambda_torch(
+            lam_ext=lam_ext,
+            eq52=eq52,
+            eq53=eq53,
+            theta_deg=doas_deg,
+            max_var_deg2=self.max_var_deg2,
+        )
+
+        # Final safety clamp.
+        # cov_diag_deg2 is the covariance diagonal / variance in deg^2.
+        # Max 90 degree uncertainty means max variance = 90^2 = 8100 deg^2.
+        #
+        # This is already aligned to the external DOA order because Eq.52/Eq.53
+        # used lam_ext and V_ext after match_perm_to_external.
+        cov_diag_deg2 = var_deg2.to(dtype=doas_deg.dtype).clamp(
+            min=0.0,
+            max=self.max_var_deg2,
+        )
+        sigma_deg = torch.sqrt(cov_diag_deg2)
 
 
-            var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_i, eq52_i, eq53_i, np.deg2rad(theta_hat_deg[i] + 90.0),
-                                                              clip_nonneg=True)
+        return sigma_deg, cov_diag_deg2
 
 
-
-            #eq52_e = compute_eq52_weighted(lam_e, q_e, E_x, J1, J2, covHs_gh, v_e)
-            #eq53_e = compute_eq53_weighted(lam_e, q_e, E_x, J1, J2, covTs_gh, v_e)
-
-            #ext_var_hat = compute_eq58_half_lambda_from_eq52_eq53(lam_e, eq52_e, eq53_e, np.deg2rad(theta_hat_deg[i]),
-            #                                                  clip_nonneg=True)
-
-
-            #print(f'when Using lam_ externel {ext_var_hat=} {lam_e=} {eq52_e=} {eq53_e=}, {v_e=}, {q_e=}')
-            pred_hat_deg2[i] = var_hat * ((180 / np.pi) ** 2)
-            #print(f'when Using lam_i {np.sqrt(pred_hat_deg2[i])=} {pred_hat_deg2[i]=} {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, {v_i=}, {q_i=}')
-            # CLip at maximum 90 degree of uncertainty
-            pred_hat_deg2 = np.clip(pred_hat_deg2, a_max=8100.0, a_min=0.0)
-
-
-            #print(f'when Using lam_i {var_hat=} {lam_i=} {eq52_i=} {eq53_i=}, ')
-
-        theta_hat_all.append(theta_hat_deg)
-        pred_hat_deg2_all.append(pred_hat_deg2)
-
-        pred_hat_m = np.mean(np.vstack(pred_hat_deg2_all), axis=0)  # (K,)
-        #print(f'{pred_hat_m=}')
-
-        return torch.Tensor(pred_hat_m)
-
-    def forward(self, doas_deg, Rx):
-        """
-        Return the Std Deviation of the uncertainty
-        :param doas_deg: The predicated doa's used as part of uncertainty calculation (as close as to boresight the better accuracy)
-        :param Rx: The calculated coveriance matrix of the signal
-        :return: StdDeviation of the uncertainty
-        """
-        # Run in batch mode
-        uncertainty = torch.zeros_like(doas_deg)
-        for index in range(doas_deg.shape[0]):
-            uncertainty[index] = self.compute_predicated_uncertainty(doas_deg[index], Rx[index])
-
-        #plot_sigma_vs_doa(doas_deg, torch.sqrt(uncertainty))
-        return torch.sqrt(uncertainty)

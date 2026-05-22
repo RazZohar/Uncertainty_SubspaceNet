@@ -66,7 +66,14 @@ class MultiSubarraysModel(nn.Module):
             # Add the learned attentaion layer
             self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
 
-            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(subarray_configuration[subarray_index]['system_model']['T']))
+            # Load Uncertainty estimation block
+            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(
+                signal_shape=subarray_configuration[subarray_index]['system_model']['T'],
+                subarray_shift=1,
+                complex_dtype=torch.complex64,
+                chunk_size=None,
+            ))
+
 
 
     def _create_subarray_model_by_configuration(self, subarray_configuration):
@@ -121,6 +128,7 @@ class MultiSubarraysModel(nn.Module):
             z_i_stack = torch.stack(z_i, dim=1)
 
         sigma_i = []
+        full_covariance_i = []
         for subarray_index in range(self.number_of_sensors):
             # if we need to fuse sensor use z_i instead of q_i
             if self.fuse_sensors is False:
@@ -132,8 +140,8 @@ class MultiSubarraysModel(nn.Module):
             bearings.append(doa_pred)
             if self.estimate_uncertainty is True:
                 with torch.no_grad():
-                    sigma = self.uncertainty_pred[subarray_index].forward((doa_pred).rad2deg(), R)
-
+                    sigma, full_covariance = self.uncertainty_pred[subarray_index].forward((doa_pred).rad2deg(), R)
+                    full_covariance_i.insert(subarray_index, full_covariance)
                     sigma_i.insert(subarray_index, sigma)
 
 
@@ -144,6 +152,9 @@ class MultiSubarraysModel(nn.Module):
         if self.estimate_uncertainty is True:
             sigma_i_stack = torch.stack(sigma_i, dim=1)
             sigma_i_stack = torch.gather(sigma_i_stack, dim=2, index=bearings_order_index)
+
+            full_cov_i_stack = torch.stack(full_covariance_i, dim=1)
+            full_cov_i_stack = torch.gather(full_cov_i_stack, dim=2, index=bearings_order_index)
 
 
 
@@ -167,6 +178,7 @@ class MultiSubarraysModel(nn.Module):
 
             if self.estimate_uncertainty is True:
                 requested_values["sigma_i"] = sigma_i_stack
+                requested_values["full_covariance_i"] = full_cov_i_stack
 
 
 

@@ -635,7 +635,7 @@ class Trainer:
 # CLI
 # -----------------------------------------------------------------------------
 
-def parse_args():
+def parse_args(argv=None):
     p = argparse.ArgumentParser("Train Multi‑Subarrays Model")
 
     # Data
@@ -686,15 +686,16 @@ def parse_args():
     p.add_argument("--visualize_sample_index", type=int, default=0, help="Index of the sample to track")
     p.add_argument("--log_to_wandb", action="store_true", help="Log visualizations to W&B")
 
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
-def main():
-    args = parse_args()
+def main(argv=None):
+    args = parse_args(argv)
     args.checkpoint_dir = Path(args.checkpoint_dir)
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
     Trainer(args).train()
+    return args
 
 
 if __name__ == "__main__":
