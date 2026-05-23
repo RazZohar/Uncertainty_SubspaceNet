@@ -24,6 +24,17 @@ MODEL_WANDB_PREFIXES = {
     "transmusic": "transmusic",
 }
 
+UQ_METRIC_COLUMNS = [
+    "ANEES_Raw",
+    "ANEES_Normalized",
+    "Log_ANEES_Normalized",
+    "APEC_Trace",
+    "EEC_Trace",
+    "APEC_EEC_Trace_Gap",
+    "APEC_EEC_Fro",
+    "APEC_EEC_Rel",
+]
+
 
 @contextmanager
 def patch_sys_argv(new_argv):
@@ -76,7 +87,7 @@ def _safe_float(value: Any) -> Any:
 
 
 def parse_metrics_from_text(output_text: str) -> Dict[str, Any]:
-    """Extract the same summary metrics as the previous CSV/text parser."""
+    """Extract summary metrics from the printed test.py report."""
     return {
         "Total_Loss": _safe_float(_regex_value(r"Combined Total Loss\s+:\s+([\d\.eE+-]+)", output_text)),
         "DOA_Accuracy_deg": _safe_float(_regex_value(r"DOA Accuracy \(Avg/Src\)\s+:\s+([\d\.eE+-]+)", output_text)),
@@ -84,6 +95,14 @@ def parse_metrics_from_text(output_text: str) -> Dict[str, Any]:
         "Theoretical_UE_Loss": _safe_float(_regex_value(r"Theoretical UE Loss\s+:\s+([\d\.eE+-]+)", output_text)),
         "CCRB_UE_Loss": _safe_float(_regex_value(r"CCRB UE Loss\s+:\s+([\d\.eE+-]+)", output_text)),
         "Mean_CCRB_sigma_deg": _safe_float(_regex_value(r"CCRB\s+:\s+([\d\.eE+-]+)", output_text)),
+        "ANEES_Raw": _safe_float(_regex_value(r"ANEES raw\s+:\s+([\d\.eE+-]+)", output_text)),
+        "ANEES_Normalized": _safe_float(_regex_value(r"ANEES normalized\s+:\s+([\d\.eE+-]+)", output_text)),
+        "Log_ANEES_Normalized": _safe_float(_regex_value(r"log\(ANEES norm\.\)\s+:\s+([\d\.eE+-]+)", output_text)),
+        "APEC_Trace": _safe_float(_regex_value(r"APEC trace\s+:\s+([\d\.eE+-]+)", output_text)),
+        "EEC_Trace": _safe_float(_regex_value(r"EEC trace\s+:\s+([\d\.eE+-]+)", output_text)),
+        "APEC_EEC_Trace_Gap": _safe_float(_regex_value(r"APEC-EEC trace gap\s+:\s+([\d\.eE+-]+)", output_text)),
+        "APEC_EEC_Fro": _safe_float(_regex_value(r"\|\|APEC-EEC\|\|_F\s+:\s+([\d\.eE+-]+)", output_text)),
+        "APEC_EEC_Rel": _safe_float(_regex_value(r"rel \|\|APEC-EEC\|\|_F\s+:\s+([\d\.eE+-]+)", output_text)),
     }
 
 
@@ -124,7 +143,39 @@ def build_metrics_from_returned(test_metrics: Optional[Dict[str, Any]]) -> Dict[
     except Exception:
         summary["DOA_Accuracy_deg"] = None
 
+    # Prefer the returned test.py dictionary over regex parsing for the UQ metrics.
+    # The printed report is rounded, while these values preserve full precision.
+    num_sources = m.get("num_sources", 1) or 1
+    anees_norm = m.get("anees_normalized", m.get("anees"))
+    anees_raw = m.get("anees_raw")
+    if anees_raw is None and anees_norm is not None:
+        anees_raw = anees_norm * num_sources
+
+    uq_map = {
+        "ANEES_Raw": anees_raw,
+        "ANEES_Normalized": anees_norm,
+        "Log_ANEES_Normalized": m.get("log_anees_normalized", m.get("log_anees")),
+        "APEC_Trace": m.get("apec_trace"),
+        "EEC_Trace": m.get("eec_trace"),
+        "APEC_EEC_Trace_Gap": m.get("apec_eec_trace_gap"),
+        "APEC_EEC_Fro": m.get("apec_eec_fro"),
+        "APEC_EEC_Rel": m.get("apec_eec_rel"),
+    }
+    for key, value in uq_map.items():
+        summary[key] = _safe_float(value)
+
     return summary
+
+
+def merge_metrics(test_metrics: Optional[Dict[str, Any]], output_text: str) -> Dict[str, Any]:
+    """Use full-precision values returned by test.main(), with stdout parsing as fallback."""
+    parsed = parse_metrics_from_text(output_text)
+    returned = build_metrics_from_returned(test_metrics)
+    merged = dict(parsed)
+    for key, value in returned.items():
+        if value is not None:
+            merged[key] = value
+    return merged
 
 
 def write_csv_row(
@@ -149,6 +200,14 @@ def write_csv_row(
         "Theoretical_UE_Loss": parsed_metrics.get("Theoretical_UE_Loss", "NaN"),
         "CCRB_UE_Loss": parsed_metrics.get("CCRB_UE_Loss", "NaN"),
         "Mean_CCRB_sigma_deg": parsed_metrics.get("Mean_CCRB_sigma_deg", "NaN"),
+        "ANEES_Raw": parsed_metrics.get("ANEES_Raw", "NaN"),
+        "ANEES_Normalized": parsed_metrics.get("ANEES_Normalized", "NaN"),
+        "Log_ANEES_Normalized": parsed_metrics.get("Log_ANEES_Normalized", "NaN"),
+        "APEC_Trace": parsed_metrics.get("APEC_Trace", "NaN"),
+        "EEC_Trace": parsed_metrics.get("EEC_Trace", "NaN"),
+        "APEC_EEC_Trace_Gap": parsed_metrics.get("APEC_EEC_Trace_Gap", "NaN"),
+        "APEC_EEC_Fro": parsed_metrics.get("APEC_EEC_Fro", "NaN"),
+        "APEC_EEC_Rel": parsed_metrics.get("APEC_EEC_Rel", "NaN"),
     }
 
     with open(csv_path, mode="a", newline="") as csv_file:
@@ -157,7 +216,8 @@ def write_csv_row(
 
     print(
         f"   -> Saved CSV metrics for [{model_type}/{eval_target}]: "
-        f"Acc={row['DOA_Accuracy_deg']}°, UE={row['Net_UE_Loss']}"
+        f"Acc={row['DOA_Accuracy_deg']}°, UE={row['Net_UE_Loss']}, "
+        f"ANEES={row['ANEES_Normalized']}, APEC/EEC rel={row['APEC_EEC_Rel']}"
     )
     return row
 
@@ -225,7 +285,7 @@ def append_full_record(
     output_text_path: str,
 ):
     returned_summary = build_metrics_from_returned(test_metrics)
-    parsed_metrics = parse_metrics_from_text(output_text)
+    parsed_metrics = merge_metrics(test_metrics, output_text)
 
     record = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -317,6 +377,7 @@ def main(argv=None):
         "Theoretical_UE_Loss",
         "CCRB_UE_Loss",
         "Mean_CCRB_sigma_deg",
+        *UQ_METRIC_COLUMNS,
     ]
     with open(summary_csv_path, mode="w", newline="") as csv_file:
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
@@ -466,7 +527,7 @@ def main(argv=None):
                     with open(output_text_path, "w", encoding="utf-8") as f:
                         f.write(test_output)
 
-                    parsed_metrics = parse_metrics_from_text(test_output)
+                    parsed_metrics = merge_metrics(test_metrics, test_output)
                     parsed_row = write_csv_row(
                         summary_csv_path,
                         args.param,
@@ -536,7 +597,7 @@ def main(argv=None):
             with open(output_text_path, "w", encoding="utf-8") as f:
                 f.write(esprit_output)
 
-            parsed_metrics = parse_metrics_from_text(esprit_output)
+            parsed_metrics = merge_metrics(esprit_metrics, esprit_output)
             parsed_row = write_csv_row(
                 summary_csv_path,
                 args.param,

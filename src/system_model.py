@@ -31,6 +31,7 @@ class SystemModelParams:
         signal_type (str): Signal type ("NarrowBand" or "Broadband").
         freq_values (list): Frequency values for Broadband signal.
         signal_nature (str): Signal nature ("non-coherent" or "coherent").
+        modulation (str): NarrowBand modulation scheme ("Gaussian", "BPSK", "QPSK", "16QAM").
         snr (float): Signal-to-noise ratio.
         eta (float): Level of deviation from sensor location.
         bias (float): Sensors locations bias deviation.
@@ -46,6 +47,7 @@ class SystemModelParams:
     signal_type = "NarrowBand"  # Signal type ("NarrowBand" or "Broadband")
     freq_values = [0, 500]  # Frequency values for Broadband signal
     signal_nature = "non-coherent"  # Signal nature ("non-coherent" or "coherent")
+    modulation = "Gaussian"  # NarrowBand modulation scheme ("Gaussian", "BPSK", "QPSK", "16QAM")
     snr = 10  # Signal-to-noise ratio
     eta = 0  # Sensor location deviation
     bias = 0  # Sensor bias deviation
@@ -62,6 +64,14 @@ class SystemModelParams:
         Returns:
             SystemModelParams: The SystemModelParams object.
         """
+        if name == "modulation":
+            valid_modulations = {"Gaussian", "BPSK", "QPSK", "16QAM"}
+            if value not in valid_modulations:
+                raise ValueError(
+                    f"Unsupported modulation '{value}'. "
+                    f"Supported modulations are: {sorted(valid_modulations)}"
+                )
+
         self.__setattr__(name, value)
         return self
 

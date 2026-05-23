@@ -315,8 +315,12 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
         uq_scalars = {
             "anees": 0.0,
             "log_anees": 0.0,
+            "anees_raw": 0.0,
+            "anees_normalized": 0.0,
+            "log_anees_normalized": 0.0,
             "apec_trace": 0.0,
             "eec_trace": 0.0,
+            "apec_eec_trace_gap": 0.0,
             "apec_eec_fro": 0.0,
             "apec_eec_rel": 0.0,
         }
@@ -483,10 +487,12 @@ def main(profiler=None, argv=None):
         print(f"  - CCRB UE Loss         : {test_metrics['ccrb_ue_loss']:.3e}")
 
         print("\nUncertainty Consistency (Eq. 26-28 style):")
-        print(f"  - ANEES                : {test_metrics['anees']:.3e}")
-        print(f"  - log(ANEES)           : {test_metrics['log_anees']:.3e}")
+        print(f"  - ANEES raw            : {test_metrics.get('anees_raw', float('nan')):.3e}")
+        print(f"  - ANEES normalized     : {test_metrics.get('anees_normalized', test_metrics['anees']):.3e}")
+        print(f"  - log(ANEES norm.)     : {test_metrics.get('log_anees_normalized', test_metrics['log_anees']):.3e}")
         print(f"  - APEC trace           : {test_metrics['apec_trace']:.3e}")
         print(f"  - EEC trace            : {test_metrics['eec_trace']:.3e}")
+        print(f"  - APEC-EEC trace gap   : {test_metrics.get('apec_eec_trace_gap', float('nan')):.3e}")
         print(f"  - ||APEC-EEC||_F       : {test_metrics['apec_eec_fro']:.3e}")
         print(f"  - rel ||APEC-EEC||_F   : {test_metrics['apec_eec_rel']:.3e}")
         print(f"{'=' * 55}\n")
@@ -500,8 +506,12 @@ def main(profiler=None, argv=None):
                 "test_ccrb_ue_loss": test_metrics["ccrb_ue_loss"],
                 "test_anees": test_metrics["anees"],
                 "test_log_anees": test_metrics["log_anees"],
+                "test_anees_raw": test_metrics.get("anees_raw", test_metrics["anees"] * test_metrics["num_sources"]),
+                "test_anees_normalized": test_metrics.get("anees_normalized", test_metrics["anees"]),
+                "test_log_anees_normalized": test_metrics.get("log_anees_normalized", test_metrics["log_anees"]),
                 "test_apec_trace": test_metrics["apec_trace"],
                 "test_eec_trace": test_metrics["eec_trace"],
+                "test_apec_eec_trace_gap": test_metrics.get("apec_eec_trace_gap", test_metrics["apec_trace"] - test_metrics["eec_trace"]),
                 "test_apec_eec_fro": test_metrics["apec_eec_fro"],
                 "test_apec_eec_rel": test_metrics["apec_eec_rel"],
             })

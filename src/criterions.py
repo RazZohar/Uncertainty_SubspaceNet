@@ -186,25 +186,42 @@ def uncertainty_consistency_metrics(doa_pred: torch.Tensor,
 
     err_col = err.unsqueeze(-1)
     solved = torch.linalg.solve(cov_stable, err_col)
-    nees = (err_col.transpose(-1, -2) @ solved).squeeze(-1).squeeze(-1)
-    if normalize_anees_by_dim:
-        nees = nees / doa_pred.shape[-1]
-    anees = nees.mean()
+
+    # NEES per sample/subarray.  ``anees_raw`` corresponds directly to
+    # e^T Sigma^{-1} e.  ``anees_normalized`` divides by the DOA dimension M,
+    # so a well-calibrated covariance should be close to 1.
+    nees_raw = (err_col.transpose(-1, -2) @ solved).squeeze(-1).squeeze(-1)
+    anees_raw = nees_raw.mean()
+    anees_normalized = anees_raw / float(doa_pred.shape[-1])
+    anees = anees_normalized if normalize_anees_by_dim else anees_raw
 
     reduce_dims = tuple(range(cov_stable.ndim - 2))
     apec_matrix = cov_stable.mean(dim=reduce_dims)
     eec_matrix = (err_col @ err_col.transpose(-1, -2)).mean(dim=reduce_dims)
 
+    apec_trace = torch.trace(apec_matrix)
+    eec_trace = torch.trace(eec_matrix)
+    apec_eec_trace_gap = apec_trace - eec_trace
     apec_eec_fro = torch.linalg.norm(apec_matrix - eec_matrix, ord="fro")
     eec_norm = torch.linalg.norm(eec_matrix, ord="fro").clamp_min(eps)
 
     return {
+        # Backward-compatible scalar key used by test.py.
         "anees": anees,
         "log_anees": torch.log(anees.clamp_min(eps)),
-        "apec_trace": torch.trace(apec_matrix),
-        "eec_trace": torch.trace(eec_matrix),
+
+        # Explicit UQ scalars for sweep CSVs.
+        "anees_raw": anees_raw,
+        "anees_normalized": anees_normalized,
+        "log_anees_normalized": torch.log(anees_normalized.clamp_min(eps)),
+        "apec_trace": apec_trace,
+        "eec_trace": eec_trace,
+        "apec_eec_trace_gap": apec_eec_trace_gap,
         "apec_eec_fro": apec_eec_fro,
         "apec_eec_rel": apec_eec_fro / eec_norm,
+
+        # Matrices are kept for optional debugging/post-processing, but test.py
+        # only returns scalar metrics.
         "apec_matrix": apec_matrix,
         "eec_matrix": eec_matrix,
     }

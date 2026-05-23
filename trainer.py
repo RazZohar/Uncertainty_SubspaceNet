@@ -34,7 +34,7 @@ from src.criterions import RMSPELoss
 from src.models import DeepCNN, DataDrivenComplexNet
 
 # If you implemented UEELoss, you can import it here
-from src.criterions import UEELoss, CombinedUncertaintyLoss, CombinedUELoss, CombinedCovarianceUncertaintyLoss
+from src.criterions import UEELoss, CombinedUncertaintyLoss, CombinedCovarianceUncertaintyLoss
 from src.transmusic import TransMUSIC
 
 
