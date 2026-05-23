@@ -193,11 +193,11 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
 
     for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
         with record_function("eval_step"):
-            sensor_positions = sensor_positions.to(device)
-            source_positions = source_positions.to(device)
-            samples = samples.to(device)
+            sensor_positions = sensor_positions.to(device, non_blocking=True)
+            source_positions = source_positions.to(device, non_blocking=True)
+            samples = samples.to(device, non_blocking=True)
+            doa_gt = torch.deg2rad(doa_gt.to(device, non_blocking=True))
 
-            doa_gt = torch.deg2rad(doa_gt).to(device)
             num_sources = doa_gt.shape[-1]
 
             if doa_only:

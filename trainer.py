@@ -44,6 +44,15 @@ MODEL_WANDB_PREFIXES = {
     "transmusic": "transmusic",
     "deepcnn": "deepcnn",
 }
+if torch.cuda.is_available():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
+    try:
+        torch.set_float32_matmul_precision("high")
+    except Exception as e:
+        print("Cannot set float 32 matrix ", e)
 
 
 def get_wandb_prefix(args) -> str:
@@ -375,10 +384,10 @@ class Trainer:
             batch_size = loader.batch_size
 
         # Track all three metrics
-        running_total_loss = 0.0
-        running_rmspe_sq = 0.0
-        running_ue_loss = 0.0
-        current_num_sources = 1  # Dynamically track sources for metric printouts
+        running_total_loss = torch.zeros((), device=self.device)
+        running_rmspe_sq = torch.zeros((), device=self.device)
+        running_ue_loss = torch.zeros((), device=self.device)
+
 
         ctx = torch.enable_grad() if train else torch.no_grad()
 
@@ -386,16 +395,16 @@ class Trainer:
             for sensor_positions, source_positions, samples, doa_gt in tqdm(loader, desc="Train" if train else "Val",
                                                                             leave=False):
 
-                sensor_positions = sensor_positions.to(self.device)
-                source_positions = source_positions.to(self.device)
-                samples = samples.to(self.device)
-                doa_gt = torch.deg2rad(doa_gt).to(self.device)
+                sensor_positions = sensor_positions.to(self.device, non_blocking=True)
+                source_positions = source_positions.to(self.device, non_blocking=True)
+                samples = samples.to(self.device, non_blocking=True)
+                doa_gt = torch.deg2rad(doa_gt.to(self.device, non_blocking=True))
 
                 # Extract number of sources dynamically
                 current_num_sources = doa_gt.shape[-1]
 
                 if train:
-                    self.optimizer.zero_grad()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 if self.current_doa_only:
                     model_result = self.model(sensor_positions, samples, doa_gt)
@@ -427,8 +436,11 @@ class Trainer:
                             ue_loss = torch.zeros((), device=self.device)
 
                     # Accumulate for logging
-                    running_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else float(rmspe_sq)
-                    running_ue_loss += ue_loss.item() if isinstance(ue_loss, torch.Tensor) else float(ue_loss)
+                    #running_rmspe_sq += rmspe_sq.item() if isinstance(rmspe_sq, torch.Tensor) else float(rmspe_sq)
+                    #running_ue_loss += ue_loss.item() if isinstance(ue_loss, torch.Tensor) else float(ue_loss)
+
+                    running_rmspe_sq += rmspe_sq.detach()
+                    running_ue_loss += ue_loss.detach()
                 else:
                     doa_pred, pos_pred, dop = self.model(sensor_positions, samples, source_positions)
                     loss = self.criterion(pos_pred, source_positions.squeeze(-2))
@@ -440,18 +452,18 @@ class Trainer:
                 if train:
                     loss.backward()
                     self.optimizer.step()
-                    self.model.zero_grad()
+                    #self.model.zero_grad()
 
-                running_total_loss += loss.item()
+                running_total_loss += loss.detach()
 
         divisor = len(loader) * batch_size
 
         # Return a dictionary containing the averaged metrics for this epoch
         return {
-            "total_loss": running_total_loss / divisor,
-            "rmspe_sq": running_rmspe_sq / divisor,
-            "ue_loss": running_ue_loss / divisor,
-            "num_sources": current_num_sources
+            "total_loss": (running_total_loss / divisor).item(),
+            "rmspe_sq": (running_rmspe_sq / divisor).item(),
+            "ue_loss": (running_ue_loss / divisor).item(),
+            "num_sources": current_num_sources,
         }
 
     def train_epoch(self):
