@@ -22,9 +22,8 @@ def get_location_from_model_graph(model_graph, type_req='sensor'):
 
 
 class MultiSubarraysModel(nn.Module):
-    def __init__(self, sensors_positions, multi_model_configuration,args):
+    def __init__(self, sensors_positions, multi_model_configuration, args):
         super(MultiSubarraysModel, self).__init__()
-
 
         self.sensors_graph = sensors_positions
         self.args = args
@@ -33,7 +32,7 @@ class MultiSubarraysModel(nn.Module):
         self.subarray_models = nn.ModuleList()
         self.learned_attentaion = nn.ModuleList()
 
-        # Init the uncertainty predication block
+        # Init the uncertainty prediction block
         self.uncertainty_pred = nn.ModuleList()
 
         self.create_model(subarrays_config)
@@ -41,17 +40,16 @@ class MultiSubarraysModel(nn.Module):
         #self.attentaion_list = nn.ModuleList()
         #self.create_attentaion_by_position(sensors_positions)
 
-        # Doa Assosication block
+        # DOA association / localization block
         self.rays_intersection = RayIntersection()
 
-        # Change Those flags by train/inference iterations
+        # Change those flags by train/inference iterations
         self.estimate_uncertainty = False
+        # Full covariance is always computed whenever uncertainty is enabled.
+        # The training loss still uses only sigma_i / diagonal variance.
+        self.estimate_full_covariance = True
         self.fuse_sensors = False
         self.estimate_position = False
-
-
-
-
 
     def _load_multi_model_configuration(self, multi_model_configuration_filename):
         multi_model_configuration = json.load(open(multi_model_configuration_filename))
@@ -60,59 +58,36 @@ class MultiSubarraysModel(nn.Module):
     def create_model(self, subarray_configuration):
         for subarray_index in range(self.number_of_sensors):
             subarray_model = self._create_subarray_model_by_configuration(subarray_configuration[subarray_index])
-            # subarray_model.set_batch_size(self.args.batch_size)
             self.subarray_models.insert(subarray_index, subarray_model)
 
-            # Add the learned attentaion layer
+            # Add the learned attention layer
             self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
 
-            # Load Uncertainty estimation block
-            self.uncertainty_pred.insert(subarray_index, UncertaintyEstimation(
-                signal_shape=subarray_configuration[subarray_index]['system_model']['T'],
-                subarray_shift=1,
-                complex_dtype=torch.complex64,
-                chunk_size=None,
-            ))
-
-
+            self.uncertainty_pred.insert(
+                subarray_index,
+                UncertaintyEstimation(subarray_configuration[subarray_index]['system_model']['T'])
+            )
 
     def _create_subarray_model_by_configuration(self, subarray_configuration):
         system_model_params = SystemModelParams()
         system_model_params.set_params_from_json(subarray_configuration)
-        return SignalsSubspaceNetEsprit(N=system_model_params.N,
-                                        T=system_model_params.T,
-                                        tau=8,
-                                        M=system_model_params.M,
-                                        codebook_size=system_model_params.codebook_size,
-                                        quantize_source=False)
+        return SignalsSubspaceNetEsprit(
+            N=system_model_params.N,
+            T=system_model_params.T,
+            tau=8,
+            M=system_model_params.M,
+            codebook_size=system_model_params.codebook_size,
+            quantize_source=False)
 
 
     def forward(self, sensor_location, IQ_signals_stack, gt_pos):
-
-        # sensor_location = get_location_from_model_graph(model_graph)
-
         bearings = []
         q_i = []
+
         for subarray_index in range(self.number_of_sensors):
-            # Original
-            # iq_signals, doa = samples[0][subarray_index][0][0], samples[0][subarray_index][0][1]
-
-            # With new dataset
-            # iq_signals is now a tensor with dim of (B, n_arrays, __SAMPLE_SIZE_PER_SUBARRAY,N,T)
-            # if you want only one sample for sub array (as in the code before) just use iq_signals[0]
-            iq_signals = IQ_signals_stack[:,subarray_index,0,:,:] # (B, N, T)
-
-            # FIXME: gt_pos shouldn't be here, this is the ground truth position of the source,
-            # should be in the training loop only
-            # doa is now a tensor of dimension [B, M - Number of sources]. Each entry is the direction
-            # of source i from sensor array [subarray_index]
-            #doa = gt_pos[:,subarray_index]
-
-            #Suggestion:
-            # rand_idx = torch.randint(0, len(samples[subarray_index]), (1,)).item()
-            # iq_signal, doa = samples[subarray_index][rand_idx]
-
-            vq_loss , q_quantized = self.subarray_models[subarray_index].sense_device_forward(iq_signals)
+            # IQ_signals_stack: [B, n_arrays, samples_per_subarray, N, T]
+            iq_signals = IQ_signals_stack[:, subarray_index, 0, :, :]  # [B, N, T]
+            vq_loss, q_quantized = self.subarray_models[subarray_index].sense_device_forward(iq_signals)
             q_i.append(q_quantized)
 
         q_i_stack = torch.stack(q_i, dim=1)
@@ -121,66 +96,93 @@ class MultiSubarraysModel(nn.Module):
             z_i = []
             phi_i = []
             for subarray_index in range(self.number_of_sensors):
-                z, phi = self.learned_attentaion[subarray_index].forward(q_i_stack, sensor_location.squeeze(0))
+                z, phi = self.learned_attentaion[subarray_index].forward(
+                    q_i_stack,
+                    sensor_location.squeeze(0),
+                )
                 z_i.insert(subarray_index, z)
                 phi_i.insert(subarray_index, phi)
-
             z_i_stack = torch.stack(z_i, dim=1)
 
         sigma_i = []
-        full_covariance_i = []
+        cov_i = []
+
         for subarray_index in range(self.number_of_sensors):
-            # if we need to fuse sensor use z_i instead of q_i
             if self.fuse_sensors is False:
-                R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(q_i_stack[:,subarray_index,:,:])
+                R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(
+                    q_i_stack[:, subarray_index, :, :]
+                )
             else:
                 R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(
-                    z_i_stack[:, subarray_index, :, :])
+                    z_i_stack[:, subarray_index, :, :]
+                )
 
             bearings.append(doa_pred)
+
             if self.estimate_uncertainty is True:
+                # Torch analytic uncertainty block. We keep it under no_grad because
+                # it is an analytic evaluator/calibrator. Full covariance is always
+                # computed for ANEES/APEC/EEC, while the training loss still uses
+                # only sigma_i / diagonal variance.
                 with torch.no_grad():
-                    sigma, full_covariance = self.uncertainty_pred[subarray_index].forward((doa_pred).rad2deg(), R)
-                    full_covariance_i.insert(subarray_index, full_covariance)
-                    sigma_i.insert(subarray_index, sigma)
+                    sigma, cov = self.uncertainty_pred[subarray_index].forward(
+                        doa_pred.rad2deg(),
+                        R,
+                        return_covariance=True,
+                    )
+                    sigma_i.insert(subarray_index, sigma)       # [B,P], deg
+                    cov_i.insert(subarray_index, cov)           # [B,P,P], deg^2
 
+        bearings = torch.stack(bearings, dim=1)  # [B, S, P]
 
-        bearings = torch.stack(bearings, dim=1)
-
-        # Sort the bearing by [Batch, L(subarray), M(targets)] by targets
+        # Sort bearings by target dimension.
         bearings, bearings_order_index = torch.sort(bearings, dim=2)
+
         if self.estimate_uncertainty is True:
-            sigma_i_stack = torch.stack(sigma_i, dim=1)
-            sigma_i_stack = torch.gather(sigma_i_stack, dim=2, index=bearings_order_index)
+            sigma_i_stack = torch.stack(sigma_i, dim=1)  # [B, S, P]
+            sigma_i_stack = torch.gather(
+                sigma_i_stack,
+                dim=2,
+                index=bearings_order_index,
+            )
 
-            full_cov_i_stack = torch.stack(full_covariance_i, dim=1)
-            full_cov_i_stack = torch.gather(full_cov_i_stack, dim=2, index=bearings_order_index)
+            cov_i_stack = torch.stack(cov_i, dim=1)  # [B, S, P, P], deg^2
+            P = cov_i_stack.shape[-1]
 
+            # Reorder covariance rows according to the same target ordering.
+            row_idx = bearings_order_index.unsqueeze(-1).expand(-1, -1, -1, P)
+            cov_i_stack = torch.gather(cov_i_stack, dim=2, index=row_idx)
 
+            # Reorder covariance columns according to the same target ordering.
+            col_idx = bearings_order_index.unsqueeze(-2).expand(-1, -1, P, -1)
+            cov_i_stack = torch.gather(cov_i_stack, dim=3, index=col_idx)
 
-        #TODO: Assosicate angles
+            # Common metric key in radians^2 for ANEES/APEC/EEC.
+            covariance_i_stack = cov_i_stack * ((torch.pi / 180.0) ** 2)
+
         with torch.no_grad():
-            #TODO: Foward both WLS and LS to compare
             if self.estimate_position is True:
-                source_estimated_position, dop = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1))
+                source_estimated_position, dop = self.rays_intersection.forward(
+                    sensor_location,
+                    bearings.squeeze(-1),
+                )
                 if self.estimate_uncertainty is True:
-                    source_estimated_position_wls, dop_wls = self.rays_intersection.forward(sensor_location, bearings.squeeze(-1), torch.deg2rad(sigma_i_stack))
-
-                #centroid, area_soft, Sigma_s = triangulation_with_soft_area_batched(sensor_location, bearings, torch.deg2rad(sigma_i_stack.sqrt()))
+                    source_estimated_position_wls, dop_wls = self.rays_intersection.forward(
+                        sensor_location,
+                        bearings.squeeze(-1),
+                        torch.deg2rad(sigma_i_stack),
+                    )
 
         if self.args.train_doa_only:
-            requested_values = {}
-            requested_values["bearings"] = bearings
-
+            requested_values = {"bearings": bearings}
 
             if self.fuse_sensors is True:
                 requested_values["phi_i"] = phi_i
 
             if self.estimate_uncertainty is True:
-                requested_values["sigma_i"] = sigma_i_stack
-                requested_values["full_covariance_i"] = full_cov_i_stack
-
-
+                requested_values["sigma_i"] = sigma_i_stack  # degrees; loss uses this only
+                requested_values["covariance_i"] = covariance_i_stack  # radians^2; metrics use this
+                requested_values["cov_i"] = cov_i_stack  # degrees^2, full covariance for debugging/backward compatibility
 
             if self.estimate_uncertainty is True and self.estimate_position is True:
                 requested_values["source_estimated_position"] = source_estimated_position
@@ -188,32 +190,41 @@ class MultiSubarraysModel(nn.Module):
                 requested_values["source_estimated_position_wls"] = source_estimated_position_wls
                 requested_values["dop_wls"] = dop_wls
 
-            """
-            requested_values["area"] = area_soft
-            requested_values["centroid"] = centroid
-            requested_values["Sigma_s"] = Sigma_s
-            """
             return requested_values
 
-        #TODO: Assosicate angles
-
-        # Intersect rays
-        #return bearings, source_estimated_position, dop
-        #return source_estimated_position
+        # TODO: return localization output for non-DOA training path if needed.
 
     def enable_fuse_sensors(self):
         self.fuse_sensors = True
 
     def enable_uncetainty_estimation(self):
+        # Keep the original misspelled method name for backward compatibility.
         self.estimate_uncertainty = True
+
+    def enable_uncertainty_estimation(self):
+        self.enable_uncetainty_estimation()
+
+    def enable_full_covariance_estimation(self):
+        # Kept for backward compatibility. Full covariance is always enabled.
+        self.estimate_uncertainty = True
+        self.estimate_full_covariance = True
+        for block in self.uncertainty_pred:
+            block.enable_full_covariance(True)
+
+    def disable_full_covariance_estimation(self):
+        # Kept for backward compatibility, but intentionally does not disable
+        # covariance computation because covariance is now always estimated.
+        self.enable_full_covariance_estimation()
 
 
 if __name__ == '__main__':
     dataset_load = torch.load('../data/MultiSubArrays/SensorSourceGraphDataset.pkl')
-    multi_arrays_model = MultiSubarraysModel(sensors_positions=[(0, 1), (1.5, 0)], multi_model_configuration="../configuration/multi_model_configuration.json")
+    multi_arrays_model = MultiSubarraysModel(
+        sensors_positions=[(0, 1), (1.5, 0)],
+        multi_model_configuration="../configuration/multi_model_configuration.json",
+    )
 
     for scene in dataset_load:
         x_hat = multi_arrays_model(scene)
         source_true_location = torch.Tensor(get_location_from_model_graph(scene[0], type_req='source')).float()
         print(f'{x_hat=}, {source_true_location=}, {torch.norm(x_hat-source_true_location)=}')
-    #print(multi_arrays_model)

@@ -39,6 +39,178 @@ import itertools
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 #device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 
+# -----------------------------------------------------------------------------
+# Uncertainty consistency metrics: ANEES, APEC, EEC
+# -----------------------------------------------------------------------------
+
+def wrapped_angular_error(pred: torch.Tensor,
+                          target: torch.Tensor,
+                          period: float = np.pi) -> torch.Tensor:
+    """Return pred-target wrapped to [-period/2, period/2]."""
+    return ((pred - target + (period / 2.0)) % period) - (period / 2.0)
+
+
+def covariance_from_sigma_deg(sigma_deg: torch.Tensor,
+                              eps: float = 1e-12) -> torch.Tensor:
+    """
+    Build a diagonal full covariance [*, M, M] in rad^2 from sigma/std in degrees [*, M].
+    """
+    sigma_rad = torch.deg2rad(sigma_deg).clamp_min(eps)
+    return torch.diag_embed(sigma_rad.pow(2))
+
+
+def covariance_from_diag_var_deg2(var_diag_deg2: torch.Tensor,
+                                  eps: float = 1e-12) -> torch.Tensor:
+    """
+    Build a diagonal full covariance [*, M, M] in rad^2 from variance in deg^2 [*, M].
+    """
+    rad2_per_deg2 = (torch.pi / 180.0) ** 2
+    return torch.diag_embed(var_diag_deg2.clamp_min(eps) * rad2_per_deg2)
+
+
+def model_output_to_covariance_rad2(model_result: dict,
+                                    sigma_key: str = "sigma_i",
+                                    eps: float = 1e-12) -> torch.Tensor:
+    """
+    Common adapter for all current model outputs.
+
+    Preferred new keys:
+      - covariance_i / covariance: full [B,S,M,M] in rad^2.
+
+    Backward-compatible key:
+      - full_covariance_i: current MultiSubarraysModel diagonal variance [B,S,M] in deg^2.
+
+    Fallback:
+      - sigma_i: sigma/std [B,S,M] in degrees -> diagonal covariance in rad^2.
+    """
+    if "covariance_i" in model_result:
+        cov = model_result["covariance_i"]
+        if cov.ndim == model_result[sigma_key].ndim + 1:
+            return cov
+        return covariance_from_diag_var_deg2(cov, eps=eps)
+
+    if "covariance" in model_result:
+        cov = model_result["covariance"]
+        if cov.ndim == model_result[sigma_key].ndim + 1:
+            return cov
+        return covariance_from_diag_var_deg2(cov, eps=eps)
+
+    if "full_covariance_i" in model_result:
+        cov = model_result["full_covariance_i"]
+        # In the current multi-subarray path this is actually the diagonal
+        # covariance / variance in deg^2, shaped [B,S,M].
+        if cov.ndim == model_result[sigma_key].ndim:
+            return covariance_from_diag_var_deg2(cov, eps=eps)
+        # If a future block returns full covariance in deg^2, convert it elementwise.
+        rad2_per_deg2 = (torch.pi / 180.0) ** 2
+        return cov * rad2_per_deg2
+
+    return covariance_from_sigma_deg(model_result[sigma_key], eps=eps)
+
+
+def align_predictions_and_covariance(doa_pred: torch.Tensor,
+                                      doa_true: torch.Tensor,
+                                      covariance_rad2: torch.Tensor,
+                                      period: float = np.pi) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Match predicted sources to the GT source order using the same exhaustive
+    permutation strategy as CombinedUncertaintyLoss, and apply the same
+    permutation to covariance rows and columns.
+
+    Shapes:
+      doa_pred, doa_true      : [B,S,M]
+      covariance_rad2        : [B,S,M,M]
+    """
+    if doa_pred.ndim != 3 or doa_true.ndim != 3:
+        raise ValueError(f"Expected doa tensors [B,S,M], got {tuple(doa_pred.shape)} and {tuple(doa_true.shape)}")
+    if covariance_rad2.ndim != 4:
+        raise ValueError(f"Expected covariance [B,S,M,M], got {tuple(covariance_rad2.shape)}")
+
+    B, S, M = doa_pred.shape
+    if doa_true.shape != (B, S, M):
+        raise ValueError(f"doa shape mismatch: pred={tuple(doa_pred.shape)}, true={tuple(doa_true.shape)}")
+    if covariance_rad2.shape != (B, S, M, M):
+        raise ValueError(f"covariance shape mismatch: got {tuple(covariance_rad2.shape)}, expected {(B,S,M,M)}")
+
+    perm_indices = torch.tensor(list(itertools.permutations(range(M))), device=doa_pred.device)
+    num_perms = perm_indices.shape[0]
+
+    preds_exp = doa_pred.unsqueeze(2).expand(B, S, num_perms, M)
+    perms_exp = perm_indices.view(1, 1, num_perms, M).expand(B, S, num_perms, M)
+    preds_perm = torch.gather(preds_exp, dim=3, index=perms_exp)
+
+    err_perm = wrapped_angular_error(preds_perm, doa_true.unsqueeze(2), period=period)
+    mse_per_perm = torch.mean(err_perm.pow(2), dim=3)
+    best_perm_idx = torch.argmin(mse_per_perm, dim=2)  # [B,S]
+    best_perm = perm_indices[best_perm_idx]            # [B,S,M]
+
+    doa_aligned = torch.gather(doa_pred, dim=2, index=best_perm)
+
+    row_index = best_perm.unsqueeze(-1).expand(B, S, M, M)
+    cov_rows = torch.gather(covariance_rad2, dim=2, index=row_index)
+    col_index = best_perm.unsqueeze(-2).expand(B, S, M, M)
+    cov_aligned = torch.gather(cov_rows, dim=3, index=col_index)
+
+    return doa_aligned, doa_true, cov_aligned
+
+
+def stabilize_covariance(covariance_rad2: torch.Tensor,
+                         eps: float = 1e-9) -> torch.Tensor:
+    """Symmetrize covariance and add jitter for stable linear solves."""
+    covariance_rad2 = 0.5 * (covariance_rad2 + covariance_rad2.transpose(-1, -2))
+    eye = torch.eye(covariance_rad2.shape[-1], device=covariance_rad2.device, dtype=covariance_rad2.dtype)
+    return covariance_rad2 + eps * eye.view(*([1] * (covariance_rad2.ndim - 2)), *eye.shape)
+
+
+def uncertainty_consistency_metrics(doa_pred: torch.Tensor,
+                                    doa_true: torch.Tensor,
+                                    covariance_rad2: torch.Tensor,
+                                    *,
+                                    normalize_anees_by_dim: bool = True,
+                                    period: float = np.pi,
+                                    eps: float = 1e-9) -> dict[str, torch.Tensor]:
+    """
+    Compute ANEES, APEC, and EEC over a full dataset.
+
+    - ANEES uses e^T Sigma^{-1} e. With normalize_anees_by_dim=True,
+      the ideal value is approximately 1, and log_anees ideal is 0.
+    - APEC is the dataset average of predicted covariance.
+    - EEC is the dataset average of empirical outer-product errors.
+    """
+    doa_aligned, doa_true, cov_aligned = align_predictions_and_covariance(
+        doa_pred, doa_true, covariance_rad2, period=period
+    )
+
+    err = wrapped_angular_error(doa_aligned, doa_true, period=period)  # [B,S,M]
+    cov_stable = stabilize_covariance(cov_aligned, eps=eps)
+
+    err_col = err.unsqueeze(-1)
+    solved = torch.linalg.solve(cov_stable, err_col)
+    nees = (err_col.transpose(-1, -2) @ solved).squeeze(-1).squeeze(-1)
+    if normalize_anees_by_dim:
+        nees = nees / doa_pred.shape[-1]
+    anees = nees.mean()
+
+    reduce_dims = tuple(range(cov_stable.ndim - 2))
+    apec_matrix = cov_stable.mean(dim=reduce_dims)
+    eec_matrix = (err_col @ err_col.transpose(-1, -2)).mean(dim=reduce_dims)
+
+    apec_eec_fro = torch.linalg.norm(apec_matrix - eec_matrix, ord="fro")
+    eec_norm = torch.linalg.norm(eec_matrix, ord="fro").clamp_min(eps)
+
+    return {
+        "anees": anees,
+        "log_anees": torch.log(anees.clamp_min(eps)),
+        "apec_trace": torch.trace(apec_matrix),
+        "eec_trace": torch.trace(eec_matrix),
+        "apec_eec_fro": apec_eec_fro,
+        "apec_eec_rel": apec_eec_fro / eec_norm,
+        "apec_matrix": apec_matrix,
+        "eec_matrix": eec_matrix,
+    }
+
+
+
 def permute_prediction(prediction: torch.Tensor):
     """
     Generates all the available permutations of the given prediction tensor.
@@ -373,6 +545,72 @@ class CombinedUncertaintyLoss(nn.Module):
         else:
             return combined_loss_accumulated, acc_loss_accumulated, ue_loss_accumulated
 
+
+
+class CombinedCovarianceUncertaintyLoss(nn.Module):
+    """
+    Backward-compatible name for stages that request full covariance, while
+    intentionally computing the training loss only over the variance/diagonal.
+
+    Accepted inputs:
+        covariance_predictions: [B,S,P,P] in rad^2, or [B,S,P] sigma in rad.
+        doa_predictions:        [B,S,P] in rad.
+        doa:                    [B,S,P] in rad.
+
+    If a full covariance is provided, only diag(covariance_predictions) is used.
+    Off-diagonal terms are ignored by design. Use ANEES/APEC/EEC in evaluation
+    to assess the full covariance, not the training loss.
+    """
+
+    def __init__(
+        self,
+        lambda_val=0.7,
+        covariance_weight=1.0,  # accepted for old JSON compatibility; intentionally ignored
+        reduction='mean',
+        normalize_covariance_loss=True,  # accepted; intentionally ignored
+        diagonal_weight=1.0,  # accepted; intentionally ignored
+        offdiag_weight=1.0,   # accepted; intentionally ignored
+    ):
+        super().__init__()
+        self.lambda_val = lambda_val
+        self.reduction = reduction
+        self._diag_loss = CombinedUncertaintyLoss(lambda_val=lambda_val, reduction=reduction)
+
+    def forward(
+        self,
+        covariance_predictions: torch.Tensor,
+        doa_predictions: torch.Tensor,
+        doa: torch.Tensor,
+    ):
+        B, S, P = doa_predictions.shape
+
+        if covariance_predictions.ndim == 4:
+            if covariance_predictions.shape != (B, S, P, P):
+                raise ValueError(
+                    f"covariance_predictions must have shape {(B, S, P, P)}, "
+                    f"got {tuple(covariance_predictions.shape)}"
+                )
+            # Convert diagonal variance [rad^2] to sigma [rad], because
+            # CombinedUncertaintyLoss squares the sigma internally.
+            sigma_predictions = torch.sqrt(
+                torch.diagonal(covariance_predictions, dim1=-2, dim2=-1).clamp_min(0.0)
+            )
+        elif covariance_predictions.ndim == 3:
+            if covariance_predictions.shape != (B, S, P):
+                raise ValueError(
+                    f"sigma/variance predictions must have shape {(B, S, P)}, "
+                    f"got {tuple(covariance_predictions.shape)}"
+                )
+            sigma_predictions = covariance_predictions
+        else:
+            raise ValueError(
+                "Expected [B,S,P,P] covariance in rad^2 or [B,S,P] sigma in rad, "
+                f"got {tuple(covariance_predictions.shape)}"
+            )
+
+        return self._diag_loss(sigma_predictions, doa_predictions, doa)
+
+
 class MSPELoss(nn.Module):
     """Mean Square Periodic Error (MSPE) loss function.
     This loss function calculates the MSPE between the predicted values and the target values.
@@ -554,6 +792,12 @@ def set_criterions(criterion_name:str):
         subspace_criterion = RMSPE
     elif criterion_name.startswith("mse"):
         criterion = MSPELoss()
+        subspace_criterion = MSPE
+    elif criterion_name in {"CombinedUncertaintyLoss", "CombinedUELoss"}:
+        criterion = CombinedUncertaintyLoss()
+        subspace_criterion = MSPE
+    elif criterion_name == "CombinedCovarianceUncertaintyLoss":
+        criterion = CombinedCovarianceUncertaintyLoss()
         subspace_criterion = MSPE
     else:
         raise Exception(f"criterions.set_criterions: Criterion {criterion_name} is not defined")

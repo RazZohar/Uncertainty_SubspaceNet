@@ -559,6 +559,140 @@ def plot_sigma_vs_doa(doa_pred, sigma_pred, *, title="sigma_pred vs doa_pred"):
     fig.suptitle(title)
     plt.show()
 
+
+# -----------------------------------------------------------------------------
+# Full covariance helpers (torch, batched)
+# -----------------------------------------------------------------------------
+
+def compute_lambda_covariance_matrices_torch(
+    lam_ext: torch.Tensor,
+    V_ext: torch.Tensor,
+    E_x: torch.Tensor,
+    J1: torch.Tensor,
+    J2: torch.Tensor,
+    covHs: torch.Tensor,
+    covTs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Batched pairwise extension of Eq.52/Eq.53.
+
+    Returns:
+        K_lambda:
+            [B,d,d], E{delta lambda_i delta lambda_j^*}
+        K_tilde_lambda:
+            [B,d,d], E{delta lambda_i delta lambda_j}
+
+    This is the torch/batched analogue of the NumPy full-covariance path,
+    but it avoids per-sample CPU/SciPy calls.
+    """
+    if lam_ext.ndim != 2:
+        raise ValueError(f"lam_ext must be [B,d], got {tuple(lam_ext.shape)}")
+    if V_ext.ndim != 3:
+        raise ValueError(f"V_ext must be [B,d,d], got {tuple(V_ext.shape)}")
+
+    B, d = lam_ext.shape
+    if V_ext.shape != (B, d, d):
+        raise ValueError(f"V_ext shape mismatch: got {tuple(V_ext.shape)}, expected {(B, d, d)}")
+
+    # E_x_pinv: [B,d,rows]
+    E_x_pinv = torch.linalg.pinv(E_x)
+
+    # Rows of inv(V) are the normalized left eigenvector rows.
+    Q_rows = torch.linalg.inv(V_ext)  # [B,d,d]
+
+    # A52_i = J1 - conj(lambda_i) J2; A53_i = J2 - lambda_i J1
+    A52 = J1[None, None, :, :] - lam_ext.conj()[:, :, None, None] * J2[None, None, :, :]
+    A53 = J2[None, None, :, :] - lam_ext[:, :, None, None] * J1[None, None, :, :]
+
+    # left52_i = q_i @ pinv(E_x) @ A52_i, left53_i analogously.
+    left52 = torch.einsum("bid,bdr,birn->bin", Q_rows, E_x_pinv, A52)  # [B,d,N]
+    left53 = torch.einsum("bid,bdr,birn->bin", Q_rows, E_x_pinv, A53)  # [B,d,N]
+
+    # middle52_ij = sum_{g,h} v_i[g] conj(v_j[h]) CovH[g,h]
+    # middle53_ij = sum_{g,h} v_i[g]      v_j[h]  CovT[g,h]
+    W52 = torch.einsum("bgi,bhj->bijgh", V_ext, V_ext.conj())  # [B,i,j,g,h]
+    W53 = torch.einsum("bgi,bhj->bijgh", V_ext, V_ext)         # [B,i,j,g,h]
+
+    middle52 = torch.einsum("bijgh,bghmn->bijmn", W52, covHs)  # [B,d,d,N,N]
+    middle53 = torch.einsum("bijgh,bghmn->bijmn", W53, covTs)  # [B,d,d,N,N]
+
+    # Pairwise Eq.52/Eq.53.
+    K_lambda = torch.einsum("bin,bijnm,bjm->bij", left52, middle52, left52.conj())
+    K_tilde_lambda = torch.einsum("bin,bijnm,bjm->bij", left53, middle53, left53)
+
+    # Enforce expected numerical symmetries.
+    K_lambda = 0.5 * (K_lambda + K_lambda.conj().transpose(-1, -2))
+    K_tilde_lambda = 0.5 * (K_tilde_lambda + K_tilde_lambda.transpose(-1, -2))
+    return K_lambda, K_tilde_lambda
+
+
+def full_doa_covariance_from_lambda_covariance_torch(
+    lam_ext: torch.Tensor,
+    theta_deg: torch.Tensor,
+    K_lambda: torch.Tensor,
+    K_tilde_lambda: torch.Tensor,
+    shift: int = 1,
+    eps: float = 1e-8,
+    max_var_deg2: float = 8100.0,
+) -> torch.Tensor:
+    """
+    Matrix version of the active Eq.58 convention used by the scalar path.
+
+    Inputs:
+        lam_ext:         [B,d]
+        theta_deg:       [B,d]
+        K_lambda:        [B,d,d]
+        K_tilde_lambda:  [B,d,d]
+
+    Returns:
+        Sigma_theta_deg2: [B,d,d], real full DOA covariance in deg^2.
+
+    The diagonal is clipped to [0, max_var_deg2]. Off-diagonal signs are kept.
+    """
+    if lam_ext.ndim != 2 or theta_deg.ndim != 2:
+        raise ValueError("lam_ext and theta_deg must both be [B,d]")
+
+    B, d = theta_deg.shape
+    if K_lambda.shape != (B, d, d) or K_tilde_lambda.shape != (B, d, d):
+        raise ValueError(
+            f"K matrices must be {(B, d, d)}, got K_lambda={tuple(K_lambda.shape)}, "
+            f"K_tilde_lambda={tuple(K_tilde_lambda.shape)}"
+        )
+
+    real_dtype = theta_deg.dtype
+    theta_rad = torch.deg2rad(theta_deg)
+
+    # Keep the same convention as the existing scalar implementation:
+    # cos(theta + pi)^2 == cos(theta)^2 on the diagonal, but for covariance
+    # the sign of c_i*c_j matters, so we preserve the signed cosine.
+    c = torch.cos(theta_rad + math.pi)
+    c = torch.where(c.abs() < eps, torch.sign(c).masked_fill(c == 0, 1.0) * eps, c)
+
+    alpha = math.pi * float(shift)
+    scale = 1.0 / (2.0 * (alpha ** 2) * (c[:, :, None] * c[:, None, :]))
+
+    lam_i_conj = lam_ext.conj()[:, :, None]
+    lam_j = lam_ext[:, None, :]
+    lam_j_conj = lam_ext.conj()[:, None, :]
+
+    val = (
+        K_lambda * lam_i_conj * lam_j
+        - K_tilde_lambda * lam_i_conj * lam_j_conj
+    ).real
+
+    sigma_rad2 = scale * val
+    sigma_rad2 = 0.5 * (sigma_rad2 + sigma_rad2.transpose(-1, -2))
+
+    deg_per_rad = torch.tensor(180.0 / math.pi, device=theta_deg.device, dtype=real_dtype)
+    sigma_deg2 = sigma_rad2.to(real_dtype) * deg_per_rad.pow(2)
+    sigma_deg2 = 0.5 * (sigma_deg2 + sigma_deg2.transpose(-1, -2))
+
+    # Diagonal safety only; keep off-diagonal signs/magnitudes.
+    diag = torch.diagonal(sigma_deg2, dim1=-2, dim2=-1).clamp(min=0.0, max=max_var_deg2)
+    sigma_deg2 = sigma_deg2 - torch.diag_embed(torch.diagonal(sigma_deg2, dim1=-2, dim2=-1)) + torch.diag_embed(diag)
+    return sigma_deg2
+
+
 # -----------------------------------------------------------------------------
 # Main module
 # -----------------------------------------------------------------------------
@@ -567,23 +701,19 @@ class UncertaintyEstimation(nn.Module):
     """
     Batched GPU/torch UncertaintyEstimation.
 
-    Args:
-        signal_shape:
-            Number of snapshots Ns/T used in the Gaussian plug-in covariance.
+    Default forward behavior is backward-compatible with your current test helper:
+        sigma_deg, cov_diag_deg2 = block(doas_deg, Rx)
 
-        subarray_shift:
-            ESPRIT shift. Your current old block defaults to 1.
+    For the full covariance path:
+        sigma_deg, cov_deg2 = block(doas_deg, Rx, return_covariance=True)
 
-        complex_dtype:
-            Optional forced complex dtype. Use torch.complex64 for speed,
-            torch.complex128 for debugging/numerical comparison.
+    Important units:
+        sigma_deg      : [B,M] standard deviation in degrees
+        cov_diag_deg2  : [B,M] diagonal variance in deg^2
+        cov_deg2       : [B,M,M] full covariance in deg^2
 
-        chunk_size:
-            Optional chunk size over the batch dimension to reduce memory.
-            Example: chunk_size=128. This still avoids per-sample CPU/SciPy loops.
-
-        use_full_sums:
-            Matches the old Eq.66 implementation when True.
+    The block remains a torch implementation. No NumPy/SciPy per-sample loop is
+    used for the full covariance path.
     """
 
     def __init__(
@@ -595,6 +725,7 @@ class UncertaintyEstimation(nn.Module):
         denom_eps: float = 1e-6,
         use_full_sums: bool = True,
         max_var_deg2: float = 8100.0,
+        return_full_covariance: bool = False,
     ):
         super().__init__()
         self.signal_shape = signal_shape
@@ -604,29 +735,38 @@ class UncertaintyEstimation(nn.Module):
         self.denom_eps = float(denom_eps)
         self.use_full_sums = bool(use_full_sums)
         self.max_var_deg2 = float(max_var_deg2)
+        self.return_full_covariance = bool(return_full_covariance)
 
     def set_subarray_shift(self, subarray_shift: int):
         self.subarray_shift = int(subarray_shift)
 
-    def forward(self, doas_deg: torch.Tensor, Rx: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
+    def enable_full_covariance(self, enabled: bool = True):
+        self.return_full_covariance = bool(enabled)
+
+    def forward(
+        self,
+        doas_deg: torch.Tensor,
+        Rx: torch.Tensor,
+        return_covariance: bool = False,
+        return_variance: bool = True,
+    ):
         """
-        Return sigma/std in degrees.
-
-        doas_deg:
-            [B,M] in degrees
-
-        Rx:
-            [B,N,N] complex covariance matrix
+        Args:
+            doas_deg: [B,M] real tensor in degrees.
+            Rx:       [B,N,N] complex covariance matrix.
+            return_covariance:
+                If True, compute and return full covariance [B,M,M] in deg^2.
+            return_variance:
+                If True and return_covariance is False, return (sigma, diag_var).
+                If False and return_covariance is False, return sigma only.
 
         Returns:
-            If return_cov_diag is False:
-                sigma_deg:
-                    [B,M], standard deviation in degrees
-
-            If return_cov_diag is True:
-                sigma_deg, cov_diag_deg2:
-                    both [B,M], where cov_diag_deg2 is the matched covariance
-                    diagonal / variance in deg^2
+            return_covariance=True:
+                sigma_deg, cov_deg2
+            return_covariance=False and return_variance=True:
+                sigma_deg, cov_diag_deg2
+            return_covariance=False and return_variance=False:
+                sigma_deg
         """
         if doas_deg.ndim != 2:
             raise ValueError(f"doas_deg must be [B,M], got {tuple(doas_deg.shape)}")
@@ -635,30 +775,36 @@ class UncertaintyEstimation(nn.Module):
         if Rx.shape[0] != doas_deg.shape[0]:
             raise ValueError(f"Batch mismatch doas_deg={tuple(doas_deg.shape)}, Rx={tuple(Rx.shape)}")
 
+        need_full_cov = bool(return_covariance or self.return_full_covariance)
         B = doas_deg.shape[0]
+
         if self.chunk_size is not None and B > self.chunk_size:
             sigma_chunks = []
-            cov_chunks = []
+            aux_chunks = []
 
             for start in range(0, B, self.chunk_size):
                 end = min(start + self.chunk_size, B)
-                out = self._forward_impl(doas_deg[start:end], Rx[start:end])
+                out = self._forward_impl(
+                    doas_deg[start:end],
+                    Rx[start:end],
+                    return_covariance=need_full_cov,
+                )
+                sigma_chunk, aux_chunk = out
+                sigma_chunks.append(sigma_chunk)
+                aux_chunks.append(aux_chunk)
 
-                if self.return_cov_diag:
-                    sigma_chunk, cov_chunk = out
-                    sigma_chunks.append(sigma_chunk)
-                    cov_chunks.append(cov_chunk)
-                else:
-                    sigma_chunks.append(out)
+            sigma = torch.cat(sigma_chunks, dim=0)
+            aux = torch.cat(aux_chunks, dim=0)
+        else:
+            sigma, aux = self._forward_impl(doas_deg, Rx, return_covariance=need_full_cov)
 
-            if self.return_cov_diag:
-                return torch.cat(sigma_chunks, dim=0), torch.cat(cov_chunks, dim=0)
+        if need_full_cov:
+            return sigma, aux
+        if return_variance:
+            return sigma, aux
+        return sigma
 
-            return torch.cat(sigma_chunks, dim=0)
-
-        return self._forward_impl(doas_deg, Rx)
-
-    def _forward_impl(self, doas_deg: torch.Tensor, Rx: torch.Tensor) -> tuple(torch.Tensor, torch.Tensor):
+    def _common_batched_quantities(self, doas_deg: torch.Tensor, Rx: torch.Tensor) -> Dict[str, torch.Tensor]:
         B, d_sources = doas_deg.shape
 
         complex_dtype = self.complex_dtype or _as_complex_dtype(Rx.dtype)
@@ -667,7 +813,7 @@ class UncertaintyEstimation(nn.Module):
         Rx = Rx.to(dtype=complex_dtype)
         doas_deg = doas_deg.to(device=Rx.device, dtype=real_dtype)
 
-        # Hermitian symmetrization, same as old NumPy code.
+        # Hermitian symmetrization, same as the old NumPy code.
         Rhat = 0.5 * (Rx + Rx.conj().transpose(-1, -2))
 
         esp = batched_esprit_overlapped_torch(
@@ -684,19 +830,11 @@ class UncertaintyEstimation(nn.Module):
         alpha_hat = esp["evals"]                      # [B,N]
         S_hat = esp["evecs"]                          # [B,N,N]
 
-        # Old code normalized roots to unit circle before matching.
+        # Normalize roots before matching.
         lam = lam / lam.abs().clamp_min(1e-12)
 
-        # Match ESPRIT modes to the network/external DOA order.
-        #
-        # perm_ext_to_int[b, i] is the internal ESPRIT mode corresponding to
-        # external/network DOA doas_deg[b, i].
-        #
-        # After gathering, lam_ext[:, i] and V_ext[:, :, i] are aligned with
-        # doas_deg[:, i]. Therefore var_deg2 / cov_diag_deg2 is also returned
-        # in the external DOA order, not the arbitrary ESPRIT eigenvalue order.
+        # Match ESPRIT modes to the external/network DOA order.
         perm_ext_to_int = batched_match_perm_to_external_torch(doas_deg, lam)
-
         lam_ext = torch.gather(lam, dim=1, index=perm_ext_to_int)  # [B,d]
 
         # Gather columns of V by matched permutation.
@@ -706,10 +844,7 @@ class UncertaintyEstimation(nn.Module):
             index=perm_ext_to_int[:, None, :].expand(-1, d_sources, -1),
         )  # [B,d,d]
 
-        Rcov_conj = rcov_conj_gaussian_plugin_torch(
-            Rhat,
-            ns=self.signal_shape,
-        )  # [B,N,N,N,N]
+        Rcov_conj = rcov_conj_gaussian_plugin_torch(Rhat, ns=self.signal_shape)
 
         covHs, covTs = compute_delta_s_covariance_blocks_eq66_torch(
             S_full=S_hat,
@@ -719,6 +854,59 @@ class UncertaintyEstimation(nn.Module):
             denom_eps=self.denom_eps,
             use_full_sums=self.use_full_sums,
         )
+
+        return {
+            "doas_deg": doas_deg,
+            "Rhat": Rhat,
+            "lam_ext": lam_ext,
+            "V_ext": V_ext,
+            "E_x": E_x,
+            "J1": J1,
+            "J2": J2,
+            "covHs": covHs,
+            "covTs": covTs,
+        }
+
+    def _forward_impl(
+        self,
+        doas_deg: torch.Tensor,
+        Rx: torch.Tensor,
+        return_covariance: bool,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        q = self._common_batched_quantities(doas_deg, Rx)
+        doas_deg = q["doas_deg"]
+        lam_ext = q["lam_ext"]
+        V_ext = q["V_ext"]
+        E_x = q["E_x"]
+        J1 = q["J1"]
+        J2 = q["J2"]
+        covHs = q["covHs"]
+        covTs = q["covTs"]
+
+        if return_covariance:
+            K_lambda, K_tilde_lambda = compute_lambda_covariance_matrices_torch(
+                lam_ext=lam_ext,
+                V_ext=V_ext,
+                E_x=E_x,
+                J1=J1,
+                J2=J2,
+                covHs=covHs,
+                covTs=covTs,
+            )
+            cov_deg2 = full_doa_covariance_from_lambda_covariance_torch(
+                lam_ext=lam_ext,
+                theta_deg=doas_deg,
+                K_lambda=K_lambda,
+                K_tilde_lambda=K_tilde_lambda,
+                shift=self.subarray_shift,
+                max_var_deg2=self.max_var_deg2,
+            )
+            cov_diag_deg2 = torch.diagonal(cov_deg2, dim1=-2, dim2=-1).clamp(
+                min=0.0,
+                max=self.max_var_deg2,
+            )
+            sigma_deg = torch.sqrt(cov_diag_deg2)
+            return sigma_deg, cov_deg2
 
         eq52, eq53 = compute_eq52_eq53_all_modes_torch(
             lam_ext=lam_ext,
@@ -738,19 +926,6 @@ class UncertaintyEstimation(nn.Module):
             max_var_deg2=self.max_var_deg2,
         )
 
-        # Final safety clamp.
-        # cov_diag_deg2 is the covariance diagonal / variance in deg^2.
-        # Max 90 degree uncertainty means max variance = 90^2 = 8100 deg^2.
-        #
-        # This is already aligned to the external DOA order because Eq.52/Eq.53
-        # used lam_ext and V_ext after match_perm_to_external.
-        cov_diag_deg2 = var_deg2.to(dtype=doas_deg.dtype).clamp(
-            min=0.0,
-            max=self.max_var_deg2,
-        )
+        cov_diag_deg2 = var_deg2.to(dtype=doas_deg.dtype).clamp(min=0.0, max=self.max_var_deg2)
         sigma_deg = torch.sqrt(cov_diag_deg2)
-
-
         return sigma_deg, cov_diag_deg2
-
-

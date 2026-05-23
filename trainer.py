@@ -34,7 +34,7 @@ from src.criterions import RMSPELoss
 from src.models import DeepCNN, DataDrivenComplexNet
 
 # If you implemented UEELoss, you can import it here
-from src.criterions import UEELoss, CombinedUncertaintyLoss
+from src.criterions import UEELoss, CombinedUncertaintyLoss, CombinedUELoss, CombinedCovarianceUncertaintyLoss
 from src.transmusic import TransMUSIC
 
 
@@ -162,6 +162,8 @@ class Trainer:
         self.model = self._build_model().to(self.device)
 
         self.model.estimate_uncertainty = True
+        if hasattr(self.model, "enable_full_covariance_estimation"):
+            self.model.enable_full_covariance_estimation()
 
         # --- Log config artifacts to wandb ---
         configuration_artifact = wandb.Artifact(name="config_json", type="config")
@@ -226,11 +228,27 @@ class Trainer:
         # 6. Re-initialize Loss Function
         loss_name = stage_config.get("loss_function", "MSELoss")
 
-        if loss_name == "CombinedUncertaintyLoss":
-            # Extract lambda from the JSON, default to 0.75 if not found
+        # Full covariance is always computed whenever uncertainty is enabled.
+        # This is not controlled by the stage configuration. The loss below still
+        # uses sigma_i / diagonal variance only.
+        if hasattr(self.model, "enable_full_covariance_estimation"):
+            self.model.enable_full_covariance_estimation()
+
+        if loss_name in {"CombinedUncertaintyLoss", "CombinedUELoss"}:
+            # Extract lambda from the JSON, default to 0.75 if not found.
             stage_lambda = stage_config.get("lambda_val", 0.75)
             self.criterion = CombinedUncertaintyLoss(lambda_val=stage_lambda)
             print(f"   * Loss: {loss_name} (Lambda: {stage_lambda})")
+
+        elif loss_name == "CombinedCovarianceUncertaintyLoss":
+            # Backward-compatible stage name. This class intentionally ignores
+            # off-diagonal covariance and uses only variance/diagonal terms.
+            stage_lambda = stage_config.get("lambda_val", 0.75)
+            self.criterion = CombinedCovarianceUncertaintyLoss(lambda_val=stage_lambda)
+            print(
+                f"   * Loss: {loss_name} (Lambda: {stage_lambda}, "
+                "variance-only; off-diagonal covariance is ignored by the loss)"
+            )
 
         elif loss_name == "RMSPELoss":
             self.criterion = RMSPELoss()
@@ -245,7 +263,7 @@ class Trainer:
 
         print(f"   * Epochs: {self.current_epochs}")
         print(f"   * LR: {current_lr} | Batch Size: {current_batch_size}")
-        print(f"   * Loss: {loss_name} | DOA Only: {self.current_doa_only}\n")
+        print(f"   * Loss: {loss_name} | DOA Only: {self.current_doa_only} | Full Cov: always enabled\n")
 
     def _configure_trainable_params(self):
         """
@@ -687,7 +705,6 @@ def parse_args(argv=None):
         default=None,
         help="List of substrings of parameter names to train; others are frozen.",
     )
-
     # System / misc
     p.add_argument("--num_workers", type=int, default=0)
     p.add_argument("--checkpoint_dir", type=str, default="checkpoints")

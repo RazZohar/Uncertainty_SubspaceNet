@@ -1404,9 +1404,15 @@ class DataDrivenComplexNet(nn.Module):
         doa_pred = self.doa_head(x_flat).reshape(B, S, self.M)
         sigma_pred = (self.uncertainty_head(x_flat) + 1e-4).reshape(B, S, self.M)
 
+        # sigma_i is kept in degrees for the existing CombinedUncertaintyLoss path.
+        # The full covariance used by ANEES/APEC/EEC is represented in rad^2,
+        # because bearings/doa_gt are radians in the trainer/test pipeline.
+        covariance_i = torch.diag_embed(torch.deg2rad(sigma_pred).clamp_min(1e-8).pow(2))
+
         return {
             "bearings": doa_pred,
             "sigma_i": sigma_pred,
+            "covariance_i": covariance_i,
         }
 
 

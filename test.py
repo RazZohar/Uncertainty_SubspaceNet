@@ -18,7 +18,13 @@ from src.multi_subarrays_model import MultiSubarraysModel
 from src.models import DeepCNN  # Imported Dynamic Model
 from src.multi_model_dataset import SensorSourceGraphDataset
 
-from src.criterions import RMSPELoss, CombinedUncertaintyLoss
+from src.criterions import (
+    RMSPELoss,
+    CombinedUncertaintyLoss,
+    covariance_from_sigma_deg,
+    model_output_to_covariance_rad2,
+    uncertainty_consistency_metrics,
+)
 
 from src.learned_agg_layer import match_learned_attn_shapes
 from src.localization_block import position_errors
@@ -191,6 +197,12 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
     total_ccrb_value = 0.0
     num_sources = 1
 
+    # Dataset-level accumulators for ANEES/APEC/EEC. These metrics should be
+    # computed over the complete test set, not averaged from mini-batches.
+    all_doa_pred = []
+    all_doa_true = []
+    all_cov_pred_rad2 = []
+
     for step, (sensor_positions, source_positions, samples, doa_gt) in enumerate(loader):
         with record_function("eval_step"):
             sensor_positions = sensor_positions.to(device, non_blocking=True)
@@ -224,11 +236,13 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
 
                         doa_pred = torch.stack(doa_preds, dim=1).to(device)
                         sigma_pred_deg = calculate_true_uncertainty(doa_gt, samples, plot=False)
+                        cov_pred_rad2 = covariance_from_sigma_deg(sigma_pred_deg)
                         pos_pred = torch.zeros_like(source_positions)
                     else:
                         model_result = model(sensor_positions, samples, doa_gt)
                         doa_pred = model_result["bearings"]
                         sigma_pred_deg = model_result["sigma_i"]
+                        cov_pred_rad2 = model_output_to_covariance_rad2(model_result)
                         if model.estimate_position:
                             pos_pred = model_result.get("source_estimated_position", torch.zeros_like(source_positions))
                         else:
@@ -273,6 +287,10 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
                     total_true_ue_loss += true_ue_loss
                     total_ccrb_ue_loss += ccrb_ue_loss
 
+                    all_doa_pred.append(doa_pred.detach().cpu())
+                    all_doa_true.append(doa_gt.detach().cpu())
+                    all_cov_pred_rad2.append(cov_pred_rad2.detach().cpu())
+
             else:
                 with record_function("model_forward_pos"):
                     pred = model(sensor_positions, samples, None)
@@ -283,6 +301,26 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
             profiler.step()
 
     divisor = len(loader)
+
+    if doa_only and all_doa_pred:
+        uq_metrics = uncertainty_consistency_metrics(
+            doa_pred=torch.cat(all_doa_pred, dim=0),
+            doa_true=torch.cat(all_doa_true, dim=0),
+            covariance_rad2=torch.cat(all_cov_pred_rad2, dim=0),
+            normalize_anees_by_dim=True,
+            period=np.pi,
+        )
+        uq_scalars = {k: float(v.detach().cpu()) for k, v in uq_metrics.items() if v.ndim == 0}
+    else:
+        uq_scalars = {
+            "anees": 0.0,
+            "log_anees": 0.0,
+            "apec_trace": 0.0,
+            "eec_trace": 0.0,
+            "apec_eec_fro": 0.0,
+            "apec_eec_rel": 0.0,
+        }
+
     return {
         "total_loss": total_total_loss / divisor,
         "rmspe_sq": total_rmspe_sq / divisor,
@@ -290,7 +328,8 @@ def evaluate(model, loader, criterion, device, batch_size, doa_only, profiler=No
         "true_ue_loss": total_true_ue_loss / divisor,
         "ccrb_value" : total_ccrb_value / divisor,
         "ccrb_ue_loss": total_ccrb_ue_loss / divisor,
-        "num_sources": num_sources
+        "num_sources": num_sources,
+        **uq_scalars,
     }
 
 
@@ -316,7 +355,6 @@ def main(profiler=None, argv=None):
     parser.add_argument("--tau", type=int, default=8, help="Lag/latent parameter for data-driven complex model")
     parser.add_argument("--num_angle_bins", type=int, default=360, help="Angle grid size for TransMUSIC/DeepCNN")
     parser.add_argument("--d_spacing", type=float, default=0.5, help="ULA spacing in wavelengths for TransMUSIC")
-
     # Validation/ESPRIT Arguments
     parser.add_argument("--esprit_baseline", action="store_true", help="Run ESPRIT instead of the Neural Network")
     parser.add_argument("--visualize", action="store_true", help="Generate frame visualizations for the test set")
@@ -380,6 +418,11 @@ def main(profiler=None, argv=None):
     model.estimate_uncertainty = True
     model.estimate_position = False if args.model_type in {"data_driven_complex", "transmusic", "deepcnn"} else True
 
+    if hasattr(model, "enable_full_covariance_estimation"):
+        # Full covariance is always computed for the multi-subarray model.
+        # The loss still uses sigma_i / diagonal variance only.
+        model.enable_full_covariance_estimation()
+
     # Only load NN weights if we are NOT running ESPRIT
     if not args.esprit_baseline:
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
@@ -438,6 +481,14 @@ def main(profiler=None, argv=None):
         print(f"  - Network/ESPRIT UE Loss: {test_metrics['net_ue_loss']:.3e}")
         print(f"  - Theoretical UE Loss  : {test_metrics['true_ue_loss']:.3e}")
         print(f"  - CCRB UE Loss         : {test_metrics['ccrb_ue_loss']:.3e}")
+
+        print("\nUncertainty Consistency (Eq. 26-28 style):")
+        print(f"  - ANEES                : {test_metrics['anees']:.3e}")
+        print(f"  - log(ANEES)           : {test_metrics['log_anees']:.3e}")
+        print(f"  - APEC trace           : {test_metrics['apec_trace']:.3e}")
+        print(f"  - EEC trace            : {test_metrics['eec_trace']:.3e}")
+        print(f"  - ||APEC-EEC||_F       : {test_metrics['apec_eec_fro']:.3e}")
+        print(f"  - rel ||APEC-EEC||_F   : {test_metrics['apec_eec_rel']:.3e}")
         print(f"{'=' * 55}\n")
 
         if args.log_to_wandb and not args.esprit_baseline:
@@ -447,6 +498,12 @@ def main(profiler=None, argv=None):
                 "test_network_ue_loss": test_metrics["net_ue_loss"],
                 "test_theoretical_ue_loss": test_metrics["true_ue_loss"],
                 "test_ccrb_ue_loss": test_metrics["ccrb_ue_loss"],
+                "test_anees": test_metrics["anees"],
+                "test_log_anees": test_metrics["log_anees"],
+                "test_apec_trace": test_metrics["apec_trace"],
+                "test_eec_trace": test_metrics["eec_trace"],
+                "test_apec_eec_fro": test_metrics["apec_eec_fro"],
+                "test_apec_eec_rel": test_metrics["apec_eec_rel"],
             })
 
     # ---------------------------------------------------------

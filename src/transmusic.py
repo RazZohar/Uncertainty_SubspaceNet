@@ -140,7 +140,13 @@ class TransMUSIC(nn.Module):
         doa_preds = self.doa_head(spectrum).reshape(B, S, self.num_sources)
         sigma_deg = (self.uncertainty_head(spectrum) + 1e-4).reshape(B, S, self.num_sources)
 
+        # sigma_i is kept in degrees for the existing CombinedUncertaintyLoss path.
+        # The full covariance used by ANEES/APEC/EEC is represented in rad^2,
+        # because bearings/doa_gt are radians in the trainer/test pipeline.
+        covariance_i = torch.diag_embed(torch.deg2rad(sigma_deg).clamp_min(1e-8).pow(2))
+
         return {
             "bearings": doa_preds,
             "sigma_i": sigma_deg,
+            "covariance_i": covariance_i,
         }
