@@ -26,9 +26,6 @@ from src.criterions import (
     uncertainty_consistency_metrics,
 )
 
-from src.learned_agg_layer import match_learned_attn_shapes
-from src.localization_block import position_errors
-
 from src.visualization import visualize_ray_frame
 from src.uncertainty_block import plot_sigma_vs_doa
 
@@ -430,8 +427,6 @@ def main(profiler=None, argv=None):
     # Only load NN weights if we are NOT running ESPRIT
     if not args.esprit_baseline:
         checkpoint = torch.load(args.checkpoint_path, map_location=device)
-        if args.model_type == "multi_subarray":
-            match_learned_attn_shapes(model, checkpoint["model_state_dict"])
         model.load_state_dict(checkpoint["model_state_dict"])
 
     # --- Instantiate Correct Criterion dynamically ---

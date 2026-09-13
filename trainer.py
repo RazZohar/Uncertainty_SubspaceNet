@@ -270,10 +270,6 @@ class Trainer:
         Dynamically freezes/unfreezes model parameters.
 
         Important benchmarking rule:
-        train_scopes from the multi-subarray staged curriculum are meaningful only
-        for the multi_subarray model, because scopes such as ``subarray_models`` or
-        ``learned_attentaion`` do not exist in TransMUSIC/DataDriven baselines.
-        For baseline models, ignore non-None stage scopes and train the full model.
         """
         scopes = self.current_train_scopes
 

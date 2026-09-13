@@ -17,3 +17,5 @@ train_multisubarrays.sh
 
 #Data
 data/*
+wandb/*
+sweeps/*

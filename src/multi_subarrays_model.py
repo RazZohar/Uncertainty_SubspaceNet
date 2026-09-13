@@ -7,8 +7,6 @@ import numpy as np
 from .system_model import SystemModelParams
 from .models import SignalsSubspaceNetEsprit
 from .multi_model_dataset import SensorSourceGraphDataset, Sensor, Source
-from .localization_block import RayIntersection, triangulation_with_soft_area_batched, position_errors
-from .learned_agg_layer import LearnedAgg
 from .uncertainty_block import UncertaintyEstimation, plot_sigma_vs_doa
 
 
@@ -30,26 +28,17 @@ class MultiSubarraysModel(nn.Module):
         subarrays_config, self.number_of_sensors = self._load_multi_model_configuration(multi_model_configuration)
 
         self.subarray_models = nn.ModuleList()
-        self.learned_attentaion = nn.ModuleList()
 
         # Init the uncertainty prediction block
         self.uncertainty_pred = nn.ModuleList()
 
         self.create_model(subarrays_config)
 
-        #self.attentaion_list = nn.ModuleList()
-        #self.create_attentaion_by_position(sensors_positions)
-
-        # DOA association / localization block
-        self.rays_intersection = RayIntersection()
-
         # Change those flags by train/inference iterations
         self.estimate_uncertainty = False
         # Full covariance is always computed whenever uncertainty is enabled.
         # The training loss still uses only sigma_i / diagonal variance.
         self.estimate_full_covariance = True
-        self.fuse_sensors = False
-        self.estimate_position = False
 
     def _load_multi_model_configuration(self, multi_model_configuration_filename):
         multi_model_configuration = json.load(open(multi_model_configuration_filename))
@@ -60,8 +49,6 @@ class MultiSubarraysModel(nn.Module):
             subarray_model = self._create_subarray_model_by_configuration(subarray_configuration[subarray_index])
             self.subarray_models.insert(subarray_index, subarray_model)
 
-            # Add the learned attention layer
-            self.learned_attentaion.insert(subarray_index, LearnedAgg(self.number_of_sensors))
 
             self.uncertainty_pred.insert(
                 subarray_index,
@@ -91,18 +78,6 @@ class MultiSubarraysModel(nn.Module):
             q_i.append(q_quantized)
 
         q_i_stack = torch.stack(q_i, dim=1)
-        # TODO: Later add option to work in stages with arguments
-        if self.fuse_sensors is True:
-            z_i = []
-            phi_i = []
-            for subarray_index in range(self.number_of_sensors):
-                z, phi = self.learned_attentaion[subarray_index].forward(
-                    q_i_stack,
-                    sensor_location.squeeze(0),
-                )
-                z_i.insert(subarray_index, z)
-                phi_i.insert(subarray_index, phi)
-            z_i_stack = torch.stack(z_i, dim=1)
 
         sigma_i = []
         cov_i = []
@@ -111,10 +86,6 @@ class MultiSubarraysModel(nn.Module):
             if self.fuse_sensors is False:
                 R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(
                     q_i_stack[:, subarray_index, :, :]
-                )
-            else:
-                R, doa_pred = self.subarray_models[subarray_index].inference_device_forward(
-                    z_i_stack[:, subarray_index, :, :]
                 )
 
             bearings.append(doa_pred)
@@ -161,11 +132,6 @@ class MultiSubarraysModel(nn.Module):
             covariance_i_stack = cov_i_stack * ((torch.pi / 180.0) ** 2)
 
         with torch.no_grad():
-            if self.estimate_position is True:
-                source_estimated_position, dop = self.rays_intersection.forward(
-                    sensor_location,
-                    bearings.squeeze(-1),
-                )
                 if self.estimate_uncertainty is True:
                     source_estimated_position_wls, dop_wls = self.rays_intersection.forward(
                         sensor_location,
@@ -176,26 +142,15 @@ class MultiSubarraysModel(nn.Module):
         if self.args.train_doa_only:
             requested_values = {"bearings": bearings}
 
-            if self.fuse_sensors is True:
-                requested_values["phi_i"] = phi_i
-
             if self.estimate_uncertainty is True:
                 requested_values["sigma_i"] = sigma_i_stack  # degrees; loss uses this only
                 requested_values["covariance_i"] = covariance_i_stack  # radians^2; metrics use this
                 requested_values["cov_i"] = cov_i_stack  # degrees^2, full covariance for debugging/backward compatibility
 
-            if self.estimate_uncertainty is True and self.estimate_position is True:
-                requested_values["source_estimated_position"] = source_estimated_position
-                requested_values["dop"] = dop
-                requested_values["source_estimated_position_wls"] = source_estimated_position_wls
-                requested_values["dop_wls"] = dop_wls
 
             return requested_values
 
         # TODO: return localization output for non-DOA training path if needed.
-
-    def enable_fuse_sensors(self):
-        self.fuse_sensors = True
 
     def enable_uncetainty_estimation(self):
         # Keep the original misspelled method name for backward compatibility.
