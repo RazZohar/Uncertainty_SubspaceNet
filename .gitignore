@@ -1,0 +1,21 @@
+# Slurm files
+interactive*
+
+# Python and VSCode files
+__pycache__/
+*.pyc
+.vscode/
+.cursorrules
+
+# Project files
+requirements.txt
+wandb/
+checkpoints/
+job-*
+MultiSubArray_train.sh
+train_multisubarrays.sh
+
+#Data
+data/*
+wandb/*
+sweeps/*

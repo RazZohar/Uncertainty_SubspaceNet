@@ -465,8 +465,8 @@ class SubspaceNet(nn.Module):
         self.conv2 = nn.Conv2d(32, 32, kernel_size=2)
         self.conv3 = nn.Conv2d(64, 64, kernel_size=2)
 
-        self.batchnorm1 = nn.BatchNorm2d(16)
-        self.batchnorm2 = nn.BatchNorm2d(32)
+        #self.batchnorm1 = nn.BatchNorm2d(16)
+        #self.batchnorm2 = nn.BatchNorm2d(32)
 
         self.anti_rectifier_layer = AntiRectifierLayer(self.anti_rectifier)
 
@@ -744,8 +744,8 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
         # TODO: check sizes of Conv
 
 
-        self.batchnorm1 = nn.BatchNorm2d(16)
-        self.batchnorm2 = nn.BatchNorm2d(32)
+        #self.batchnorm1 = nn.BatchNorm2d(16)
+        #self.batchnorm2 = nn.BatchNorm2d(32)
         self.complex_rectifier = ComplexReLU(self.anti_rectifier)
 
         self.anti_rectifier_layer = AntiRectifierLayer(self.complex_rectifier)
@@ -830,10 +830,14 @@ class SignalsSubspaceNetEsprit(SubspaceNetEsprit):
                 return doa_prediction, doa_all_predictions, roots, Rz, vq_loss
                 """
         # Feed surrogate covariance to Esprit algorithm
-        doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
-        eigen_values = torch.stack([pair[0] for pair in estimated_subspace])
-        eigen_vectors = torch.stack([pair[1] for pair in estimated_subspace]) # shape: [N, D]
-        cov_doa = doa_covariance_from_eig(eigen_values, eigen_vectors, doa_prediction, self.T)
+        #doa_prediction, estimated_subspace = esprit(Rz, self.M, self.batch_size)
+        doa_prediction, estimated_subspace = esprit_batched(
+            Rz,
+            self.M,
+            use_eigh=True,
+            sort_doa=False,
+        )
+
         return Rz, doa_prediction
 
     def sense_device_forward(self, x):
@@ -1279,6 +1283,139 @@ class DeepCNN(nn.Module):
         return X
 
 
+class DataDrivenComplexNet(nn.Module):
+    """
+    Pure data-driven complex network benchmark.
+
+    The original forward path assumed one subarray and a 4-D input.  For the
+    benchmarking sweep we keep the same external contract as MultiSubarraysModel
+    and TransMUSIC: input samples may be either [B, S, R, N, T], [B, S, N, T],
+    or [B, N, T], and the output is always [B, S, M].
+    """
+
+    def __init__(self, N: int, T: int, tau: int, M: int, quantize_source=False, codebook_size=256):
+        super(DataDrivenComplexNet, self).__init__()
+        self.quantize_source = quantize_source
+
+        self.N = int(N)
+        self.T = int(T)
+        self.M = int(M)
+        self.batch_size = 1  # Set dynamically in forward
+
+        in_channels = self.N
+        out_channels = self.N
+
+        # --------------------------------------------------
+        # 1. Custom Complex DCNN Layers
+        # --------------------------------------------------
+        self.complex_rectifier = ComplexReLU(self.anti_rectifier)
+        self.anti_rectifier_layer = AntiRectifierLayer(self.complex_rectifier)
+
+        self.conv1 = ComplexConv1d(in_channels, 16, kernel_size=2)
+        self.conv2 = ComplexConv1d(32, 32, kernel_size=2)
+        self.conv3 = ComplexConv1d(64, 64, kernel_size=2)
+
+        self.deconv2 = ComplexConvTranspose1d(128, 32, kernel_size=2)
+        self.deconv3 = ComplexConvTranspose1d(64, 16, kernel_size=2)
+        self.deconv4 = ComplexConvTranspose1d(32, out_channels, kernel_size=2)
+
+        self.encoder_signal = nn.Sequential(
+            self.conv1,
+            self.anti_rectifier_layer,
+            self.conv2,
+            self.anti_rectifier_layer,
+            self.conv3,
+            self.anti_rectifier_layer,
+        )
+
+        self.decoder_signal = nn.Sequential(
+            self.deconv2,
+            self.anti_rectifier_layer,
+            self.deconv3,
+            self.anti_rectifier_layer,
+            self.deconv4,
+        )
+
+        self.T_out = self.T
+        flattened_dim = out_channels * self.T_out * 2
+
+        self.doa_head = nn.Sequential(
+            nn.Linear(flattened_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self.M),
+        )
+
+        self.uncertainty_head = nn.Sequential(
+            nn.Linear(flattened_dim, 256),
+            nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
+            nn.Linear(256, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, self.M),
+            nn.Softplus(),
+        )
+
+    @staticmethod
+    def _prepare_samples(samples: torch.Tensor) -> torch.Tensor:
+        """Return complex IQ samples as [B, S, N, T]."""
+        if samples.dim() == 5:
+            # Dataset convention: [B, S, samples_per_subarray, N, T]
+            return samples[:, :, 0, :, :]
+        if samples.dim() == 4:
+            # Already [B, S, N, T]
+            return samples
+        if samples.dim() == 3:
+            # Single subarray: [B, N, T]
+            return samples.unsqueeze(1)
+        raise ValueError(f"Unsupported samples shape for DataDrivenComplexNet: {tuple(samples.shape)}")
+
+    def anti_rectifier(self, X):
+        return torch.cat((torch.relu(X), torch.relu(-X)), dim=1)
+
+    def forward(self, sensor_positions, samples, doa_gt=None):
+        """
+        Trainer-compatible forward pass.
+
+        Args:
+            sensor_positions: ignored by this benchmark model.
+            samples: complex IQ samples shaped [B, S, R, N, T], [B, S, N, T], or [B, N, T].
+            doa_gt: ignored during forward pass.
+        """
+        x = self._prepare_samples(samples)
+        B, S, N, T = x.shape
+        if N != self.N:
+            raise ValueError(f"DataDrivenComplexNet expected N={self.N} antennas, got N={N}.")
+        if T != self.T:
+            raise ValueError(f"DataDrivenComplexNet expected T={self.T} snapshots, got T={T}.")
+
+        x = x.reshape(B * S, N, T)
+        self.batch_size = B * S
+
+        encoded = self.encoder_signal(x)
+        decoded = self.decoder_signal(encoded)
+
+        x_real = decoded.real.reshape(self.batch_size, -1)
+        x_imag = decoded.imag.reshape(self.batch_size, -1)
+        x_flat = torch.cat([x_real, x_imag], dim=1).float()
+
+        doa_pred = self.doa_head(x_flat).reshape(B, S, self.M)
+        sigma_pred = (self.uncertainty_head(x_flat) + 1e-4).reshape(B, S, self.M)
+
+        # sigma_i is kept in degrees for the existing CombinedUncertaintyLoss path.
+        # The full covariance used by ANEES/APEC/EEC is represented in rad^2,
+        # because bearings/doa_gt are radians in the trainer/test pipeline.
+        covariance_i = torch.diag_embed(torch.deg2rad(sigma_pred).clamp_min(1e-8).pow(2))
+
+        return {
+            "bearings": doa_pred,
+            "sigma_i": sigma_pred,
+            "covariance_i": covariance_i,
+        }
+
+
 def root_music(Rz: torch.Tensor, M: int, batch_size: int):
     """Implementation of the model-based Root-MUSIC algorithm, support Pytorch, intended for
         MB-DL models. the model sets for nominal and ideal condition (Narrow-band, ULA, non-coherent)
@@ -1344,6 +1481,115 @@ def root_music(Rz: torch.Tensor, M: int, batch_size: int):
         roots_to_return,
     ), subspace_batches
 
+
+
+
+
+def esprit_batched(
+    Rz: torch.Tensor,
+    M: int,
+    batch_size: int = None,
+    *,
+    use_eigh: bool = True,
+    sort_doa: bool = False,
+    clamp_eps: float = 1e-7,
+):
+    """
+    Batched PyTorch ESPRIT.
+
+    Args:
+        Rz:
+            Surrogate covariance matrix, shape [B, N, N].
+            N = number of array elements.
+        M:
+            Number of sources.
+        batch_size:
+            Kept only for backward compatibility. Not used.
+        use_eigh:
+            True is recommended if Rz is Hermitian covariance.
+            False uses torch.linalg.eig, closer to your original code.
+        sort_doa:
+            If True, sorts DOAs per batch. If your outer model already sorts bearings,
+            keep this False.
+        clamp_eps:
+            Clamp for arcsin input to avoid NaNs.
+
+    Returns:
+        doa_predictions:
+            [B, M], radians.
+        subspace_info:
+            dict with batched eigenvalues/eigenvectors.
+    """
+
+    if Rz.ndim != 3:
+        raise ValueError(f"Rz must have shape [B, N, N], got {tuple(Rz.shape)}")
+
+    B, N, N2 = Rz.shape
+    if N != N2:
+        raise ValueError(f"Rz must be square, got {tuple(Rz.shape)}")
+
+    if M <= 0 or M >= N:
+        raise ValueError(f"M must satisfy 0 < M < N. Got M={M}, N={N}")
+
+    # Covariance should be Hermitian. This improves numerical stability.
+    if use_eigh:
+        Rz_h = 0.5 * (Rz + Rz.conj().transpose(-1, -2))
+
+        # Batched Hermitian EVD.
+        # eigenvalues:  [B, N], ascending
+        # eigenvectors: [B, N, N]
+        eigenvalues, eigenvectors = torch.linalg.eigh(Rz_h)
+
+        # Signal subspace: eigenvectors of the largest M eigenvalues.
+        Us = eigenvectors[:, :, -M:]  # [B, N, M]
+
+    else:
+        # Closer to your original implementation.
+        eigenvalues, eigenvectors = torch.linalg.eig(Rz)  # [B,N], [B,N,N]
+
+        # Sort by abs eigenvalue descending, batched.
+        idx = torch.argsort(torch.abs(eigenvalues), dim=1, descending=True)[:, :M]  # [B,M]
+
+        # Gather eigenvector columns.
+        Us = torch.gather(
+            eigenvectors,
+            dim=2,
+            index=idx[:, None, :].expand(-1, N, -1),
+        )  # [B, N, M]
+
+    # Overlapping subarrays.
+    Us_upper = Us[:, :-1, :]  # [B, N-1, M]
+    Us_lower = Us[:, 1:, :]   # [B, N-1, M]
+
+    # Phi = pinv(Us_upper) @ Us_lower
+    # Batched pinv and matmul.
+    phi = torch.linalg.pinv(Us_upper) @ Us_lower  # [B, M, M]
+
+    # Batched eigenvalues of Phi.
+    phi_eigenvalues, phi_eigenvectors = torch.linalg.eig(phi)  # [B, M], [B, M, M]
+
+    # Original convention:
+    # doa = -arcsin(angle(lambda) / pi)
+    phase = torch.angle(phi_eigenvalues)
+    sin_theta = phase / math.pi
+    sin_theta = torch.clamp(sin_theta, -1.0 + clamp_eps, 1.0 - clamp_eps)
+
+    doa_predictions = -torch.arcsin(sin_theta)  # [B, M], radians
+
+    if sort_doa:
+        doa_predictions, order = torch.sort(doa_predictions, dim=1)
+        phi_eigenvalues = torch.gather(phi_eigenvalues, dim=1, index=order)
+
+    subspace_info = {
+        "eigenvalues": eigenvalues,
+        "eigenvectors": eigenvectors,
+        "signal_subspace": Us,
+        "phi": phi,
+        "phi_eigenvalues": phi_eigenvalues,
+        "phi_eigenvectors": phi_eigenvectors,
+    }
+
+    return doa_predictions, subspace_info
 
 def esprit(Rz: torch.Tensor, M: int, batch_size: int):
     """Implementation of the model-based Esprit algorithm, support Pytorch, intended for

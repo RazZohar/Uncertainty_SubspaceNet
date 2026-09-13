@@ -1,7 +1,10 @@
 {
-    "system_model": {
+  "L": 1,
+  "subarray_config": [
+    {
+      "system_model": {
         "N": 8,
-        "M": 3,
+        "M": 2,
         "T": 100,
         "snr": 10,
         "signal_type": "NarrowBand",
@@ -10,5 +13,7 @@
         "bias": 0.0,
         "sv_noise_var": 0.0,
         "codebook_size": 128
+      }
     }
+  ]
 }

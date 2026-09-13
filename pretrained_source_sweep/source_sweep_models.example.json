@@ -1,0 +1,19 @@
+{
+  "models": [
+    {
+      "model_type": "multi_subarray",
+      "checkpoint_path": "sweeps/multi_subarray/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/multi_subarray/best_base_reliability.pth",
+      "config_path": "sweeps/multi_subarray/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/config.json"
+    },
+    {
+      "model_type": "transmusic",
+      "checkpoint_path": "sweeps/transmusic/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/transmusic/best_base_reliability.pth",
+      "config_path": "sweeps/transmusic/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/config.json"
+    },
+    {
+      "model_type": "data_driven_complex",
+      "checkpoint_path": "sweeps/data_driven_complex/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/data_driven_complex/best_base_reliability.pth",
+      "config_path": "sweeps/data_driven_complex/sweep_subarray_config_0_system_model_M/subarray_config_0_system_model_M_2/config.json"
+    }
+  ]
+}

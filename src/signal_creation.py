@@ -49,6 +49,8 @@ class Samples(SystemModel):
         """
         super().__init__(system_model_params)
 
+        self.__apply_signal_decay = False
+
     def set_doa(self, doa):
         """
         Sets the direction of arrival (DOA) for the signals.
@@ -190,7 +192,12 @@ class Samples(SystemModel):
                 f"Samples.noise_creation: signal type {self.params.signal_type} is not defined"
             )
 
-    def signal_creation(self, signal_mean: float = 0, signal_variance: float = 1):
+    def signal_creation(
+        self,
+        signal_mean: float = 0,
+        signal_variance: float = 1,
+        modulation: str = None,
+    ):
         """
         Creates signals based on the specified signal nature and parameters.
 
@@ -198,6 +205,9 @@ class Samples(SystemModel):
         -----
             signal_mean (float, optional): Mean of the signal. Defaults to 0.
             signal_variance (float, optional): Variance of the signal. Defaults to 1.
+            modulation (str, optional): NarrowBand modulation scheme.
+                Supported: "Gaussian", "BPSK", "QPSK", "16QAM".
+                If None, uses self.params.modulation when it exists, otherwise "Gaussian".
 
         Returns:
         --------
@@ -207,38 +217,83 @@ class Samples(SystemModel):
         -------
             Exception: If the signal type is not defined.
             Exception: If the signal nature is not defined.
+            ValueError: If the modulation scheme is not defined.
         """
         amplitude = 10 ** (self.params.snr / 10)
+
+        if modulation is None:
+            modulation = getattr(self.params, "modulation", "Gaussian")
+        modulation = str(modulation)
+
+        def generate_narrowband_symbols(num_signals: int):
+            """
+            Generate unit-average-power baseband symbols with shape:
+                [num_signals, T]
+            """
+            if modulation == "Gaussian":
+                # Circularly symmetric complex Gaussian, E[|s|^2] = 1.
+                base = (np.sqrt(2) / 2) * (
+                    np.random.randn(num_signals, self.params.T)
+                    + 1j * np.random.randn(num_signals, self.params.T)
+                )
+
+            elif modulation == "BPSK":
+                # Real-valued BPSK, E[|s|^2] = 1.
+                base = np.random.choice(
+                    [-1, 1], size=(num_signals, self.params.T)
+                ).astype(np.complex128)
+
+            elif modulation == "QPSK":
+                # QPSK constellation, E[|s|^2] = 1.
+                i_channel = np.random.choice(
+                    [-1, 1], size=(num_signals, self.params.T)
+                )
+                q_channel = np.random.choice(
+                    [-1, 1], size=(num_signals, self.params.T)
+                )
+                base = (i_channel + 1j * q_channel) * (np.sqrt(2) / 2)
+
+            elif modulation == "16QAM":
+                # Square 16-QAM constellation normalized by sqrt(10),
+                # so E[|s|^2] = 1.
+                i_channel = np.random.choice(
+                    [-3, -1, 1, 3], size=(num_signals, self.params.T)
+                )
+                q_channel = np.random.choice(
+                    [-3, -1, 1, 3], size=(num_signals, self.params.T)
+                )
+                base = (i_channel + 1j * q_channel) / np.sqrt(10)
+
+            else:
+                raise ValueError(
+                    f"Modulation scheme '{modulation}' is not defined. "
+                    "Supported modulations are: Gaussian, BPSK, QPSK, 16QAM."
+                )
+
+            return amplitude * np.sqrt(signal_variance) * base + signal_mean
+
         # NarrowBand signal creation
         if self.params.signal_type == "NarrowBand":
             if self.params.signal_nature == "non-coherent":
-                # create M non-coherent signals
-                return (
-                    amplitude
-                    * (np.sqrt(2) / 2)
-                    * np.sqrt(signal_variance)
-                    * (
-                        np.random.randn(self.params.M, self.params.T)
-                        + 1j * np.random.randn(self.params.M, self.params.T)
-                    )
-                    + signal_mean
-                )
+                signals = generate_narrowband_symbols(self.params.M)
+
+                if self.__apply_signal_decay:
+                    # signals = self.signal_decay @ signals
+                    pass
+
+                return signals
 
             elif self.params.signal_nature == "coherent":
-                # Coherent signals: same amplitude and phase for all signals
-                sig = (
-                    amplitude
-                    * (np.sqrt(2) / 2)
-                    * np.sqrt(signal_variance)
-                    * (
-                        np.random.randn(1, self.params.T)
-                        + 1j * np.random.randn(1, self.params.T)
-                    )
-                    + signal_mean
-                )
+                # Coherent signals: one waveform copied to all M sources.
+                sig = generate_narrowband_symbols(1)
                 return np.repeat(sig, self.params.M, axis=0)
 
-        # OFDM Broadband signal creation
+            else:
+                raise Exception(
+                    f"signal nature {self.params.signal_nature} is not defined"
+                )
+
+        # OFDM Broadband signal creation remains unchanged.
         elif self.params.signal_type.startswith("Broadband"):
             num_sub_carriers = self.max_freq[
                 "Broadband"
@@ -295,3 +350,8 @@ class Samples(SystemModel):
 
         else:
             raise Exception(f"signal type {self.params.signal_type} is not defined")
+
+
+    def apply_signal_decay(self, decay_factor):
+        self.signal_decay = decay_factor
+        self.__apply_signal_decay = True
